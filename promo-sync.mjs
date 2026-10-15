@@ -8,7 +8,7 @@
  * 解法：WorkBuddy 客户端会把官方产品配置缓存到本地（Electron 自动拉取），
  * 里面 data.modelPromotions 数组带**权威到期时间**（validUntil，精确到秒）：
  *   C:\Users\oadan\.workbuddy\storage\user-*\scoped\*\wb-product-config.json
- * 本脚本定期读它 → 与 free-expiry.json 登记表比对 → 有变化就自动更新 + 私聊老大。
+ * 本脚本定期读它 → 与 free-expiry.json 登记表比对 → 有变化就自动更新 + 记时间线事件（promo-update）。
  *
  * 🔴 关键语义：validUntil 是"次日 00:00"（如 10-26T00:00 表示免费到 10-25 结束），
  *   所以 deadline = validUntil - 1 秒，展示为"10-25 23:59"。
@@ -19,7 +19,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { recordNotify } from './notify-log.mjs';
+import { appendEvent } from './events.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REGISTRY = join(HERE, 'free-expiry.json');
@@ -27,37 +27,14 @@ const STATE_FILE = process.env.PROMO_STATE || join(HERE, '.promo-sync-state.json
 const SYNC_MS = Number(process.env.PROMO_SYNC_MS || 30 * 60 * 1000); // 30 分钟一轮
 const DRY_RUN = process.env.PROMO_DRY_RUN === '1';
 
-const APP_ID = process.env.LARK_APP_ID || '';
-const APP_SECRET = process.env.LARK_APP_SECRET || '';
-const AT_OPEN_ID = process.env.LARK_ALERT_AT_OPEN_ID || 'ou_888b94e17b7d3d6dcc21ddbc6b35abb4';
 const WB_STORAGE = process.env.WB_STORAGE_ROOT || 'C:\\Users\\oadan\\.workbuddy\\storage';
 
 const log = (...a) => console.log(new Date().toISOString(), '[promo-sync]', ...a);
 
-// ── 飞书 ────────────────────────────────────────────
-let tokenCache = { token: '', at: 0 };
-async function getToken() {
-  if (tokenCache.token && Date.now() - tokenCache.at < 90 * 60 * 1000) return tokenCache.token;
-  const r = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
-  });
-  const j = await r.json();
-  if (j.code !== 0) throw new Error(`token 失败: ${j.code} ${j.msg}`);
-  tokenCache = { token: j.tenant_access_token, at: Date.now() };
-  return j.tenant_access_token;
-}
+/** 通知口：记时间线事件（可选 webhook 由 events.mjs 统一处理）。保留 sendText 名字兼容既有调用点。 */
 async function sendText(text, kind = 'promo-sync', meta) {
-  const token = await getToken();
-  const r = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ receive_id: AT_OPEN_ID, msg_type: 'text', content: JSON.stringify({ text }) }),
-  });
-  const j = await r.json();
-  if (j.code !== 0) throw new Error(`发消息失败: ${j.code} ${j.msg}`);
-  recordNotify('promo-sync', kind, text, meta);
-  return j.data?.message_id;
+  appendEvent('promo-' + kind, { text, ...meta });
+  return null;
 }
 
 // ── 找最新的 wb-product-config.json ─────────────────
@@ -179,7 +156,6 @@ async function syncOnce(state) {
 
 let stopping = false, wake = null, timer = null;
 async function main() {
-  if (!APP_ID || !APP_SECRET) { console.error('[promo-sync] 缺 LARK 凭据，退出'); process.exit(1); }
   const p = readPromotions();
   log(`启动：每 ${SYNC_MS / 60000} 分钟同步一次官方促销信息${DRY_RUN ? '（DRY RUN）' : ''}`);
   log(p ? `当前数据源：${p.file}（${p.promos.length} 条促销）` : '⚠️ 暂未找到 wb-product-config 快照');

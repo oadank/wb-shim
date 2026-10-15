@@ -11,6 +11,10 @@ logs/
 *.json
 !package.json
 
+# 事件时间线（events.mjs 运行产物；hooks.json 虽也被 *.json 盖住，明写一遍防以后改规则）
+events.jsonl
+hooks.json
+
 # 测试备份
 *.bak*
 *.testbak

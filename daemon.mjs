@@ -158,10 +158,9 @@ async function prefetchRecentUsage() {
 }
 
 import { readFileSync, writeFileSync, mkdirSync, statSync, readdirSync, existsSync, appendFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readNotifies } from './notify-log.mjs';
+import { appendEvent, readEvents } from './events.mjs';
 import { recordUsage, recordLimit } from './usage-log.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -237,6 +236,7 @@ async function refreshCredits(rt, credential) {
       rt._lowCreditWarned = c.total;
       rt.alerts = rt.alerts || [];
       rt.alerts.push({ t: Date.now(), kind: 'credits-low', total: c.total });
+      appendEvent('credits-low', { variant: rt.variant.id, total: c.total, note: `积分低于 ${CREDITS_ALERT_BELOW}，主力腿即将开始烧钱或断供` });
       log(rt.variant.id, `🔴 积分低水位: ${c.total} < ${CREDITS_ALERT_BELOW} → 主力腿即将开始烧钱或断供`);
     }
     if (!c.unlimited && c.total >= CREDITS_ALERT_BELOW) rt._lowCreditWarned = undefined;
@@ -258,22 +258,38 @@ async function refreshCredits(rt, credential) {
 function isFreeModel(m) {
   return m?.free === true || m?.billing?.free === true;
 }
-function detectFreeFlip(rt, models) {
-  const now = (models ?? []).filter(isFreeModel).map((m) => m.id).sort();
-  const prev = rt.freeIds;
-  rt.freeIds = now;
-  if (!prev) return; // 首轮建基线，不告警
-  const gone = prev.filter((id) => !now.includes(id));
-  const added = now.filter((id) => !prev.includes(id));
+/**
+ * 目录变化检测（2026-10-15 瘦身版）：目录重抓后对比全量模型名单，
+ * 增/减都记时间线事件（model-added / model-removed）——这就是"刷新主页模型
+ * 新增与减少"的份内自动化。限免名单翻转额外记 rt.alerts（/alerts 端点用）。
+ */
+function detectCatalogChanges(rt, models) {
+  const nowIds = (models ?? []).map((m) => m.id).sort();
+  const prevIds = rt.modelIds;
+  rt.modelIds = nowIds;
+  if (!prevIds) return; // 首轮建基线，不记事件
+  const removed = prevIds.filter((id) => !nowIds.includes(id));
+  const added = nowIds.filter((id) => !prevIds.includes(id));
+  if (removed.length) appendEvent('model-removed', { variant: rt.variant.id, models: removed });
+  if (added.length) appendEvent('model-added', { variant: rt.variant.id, models: added });
+  if (added.length || removed.length) log(rt.variant.id, `目录变化：+${added.length} / -${removed.length}${added.length ? ' 增: ' + added.join(', ') : ''}${removed.length ? ' 减: ' + removed.join(', ') : ''}`);
+
+  // 限免翻转（免费名单变短=到期/被撤，变长=新白嫖上线）→ rt.alerts 给 /alerts
+  const nowFree = (models ?? []).filter(isFreeModel).map((m) => m.id).sort();
+  const prevFree = rt.freeIds;
+  rt.freeIds = nowFree;
+  if (!prevFree) return;
+  const gone = prevFree.filter((id) => !nowFree.includes(id));
+  const addedFree = nowFree.filter((id) => !prevFree.includes(id));
   if (gone.length) {
     rt.alerts = rt.alerts || [];
     rt.alerts.push({ t: Date.now(), kind: 'free-gone', ids: gone });
-    log(rt.variant.id, `🔴 限免到期/被撤: ${gone.join(', ')} → 主力腿可能在烧钱，查 litellm 权重链`);
+    log(rt.variant.id, `🔴 限免到期/被撤: ${gone.join(', ')}（注意别在收费模型上白烧积分）`);
   }
-  if (added.length) {
+  if (addedFree.length) {
     rt.alerts = rt.alerts || [];
-    rt.alerts.push({ t: Date.now(), kind: 'free-added', ids: added });
-    log(rt.variant.id, `🟢 新白嫖上线: ${added.join(', ')}`);
+    rt.alerts.push({ t: Date.now(), kind: 'free-added', ids: addedFree });
+    log(rt.variant.id, `🟢 新白嫖上线: ${addedFree.join(', ')}`);
   }
 }
 
@@ -315,7 +331,7 @@ async function sweep(rt) {
         rt.catalog.set([...models]);
         rt.catalogAtMs = Date.now();
         log(rt.variant.id, `目录重抓生效：${models.length} 个模型 [${models.map((m) => m.id).join(', ')}]`);
-        detectFreeFlip(rt, models);
+        detectCatalogChanges(rt, models);
       } catch (e) {
         log(rt.variant.id, '目录重抓失败（下一轮重试）:', String(e));
       }
@@ -332,7 +348,7 @@ async function sweep(rt) {
     rt.lastIdentity = identity;
     rt.catalogAtMs = Date.now();
     log(rt.variant.id, `目录生效：${models.length} 个模型 [${models.map((m) => m.id).join(', ')}]`);
-    detectFreeFlip(rt, models);
+    detectCatalogChanges(rt, models);
     await refreshCredits(rt, credential);
   } catch (e) {
     log(rt.variant.id, '目录刷新失败:', String(e));
@@ -373,12 +389,25 @@ if (!live.length) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// 二级页面「自动化总览」数据层（2026-10-14 老大要求：功能要落地可见）
-// 回答三个问题：① 现在什么状态 ② 下次几点自动干什么 ③ 以前干过什么
-// 数据源：free-expiry.json（到期登记）+ rate-guard 状态 + 通知历史 + 服务健康
+// 二级页面「模型动态」数据层（2026-10-15 瘦身：只做份内的模型状态维护）
+// 回答三个问题：① 模型现在什么状态 ② 状态变更时间线 ③ 各模块心跳
+// 数据源：free-expiry.json（到期登记）+ rate-guard 状态 + events.jsonl 时间线 + 服务日志年龄
 // 全部只读、免鉴权（不含任何令牌/key）
 // ════════════════════════════════════════════════════════════════
 const WB_DIR = HERE; // 与 daemon 同目录（C:\D\opt\wb-shim）
+// 组名 → 上游模型名（与 rate-guard.mjs upstreamOf 同源；限流状态卡片/首页徽章用）
+const GROUP_MODEL = {
+  'wb-dsv4.1fin': 'deepseek-v4.1-flash-intl',
+  'wbi-dsv4.1fi': 'deepseek-v4.1-flash-intl',
+  'wb-st5pcn': 'step-5-preview',
+  'wb-st5pin': 'step-5-preview-intl',
+  'wb-hy3': 'hy3-intl',
+  'wb-hy3cn': 'hy3',
+  'wb-step5': 'step-5-preview',
+  'wb-glm5.3f': 'glm-5.3-flash',
+  'wb-hy4-preview': 'hy4-preview',
+  'wb-hy4-preview-intl': 'hy4-preview',
+};
 function readJsonSafe(p, fallback) {
   try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return fallback; }
 }
@@ -421,61 +450,41 @@ function humanLeftLocal(ms) {
   return `${m} 分钟`;
 }
 
-/** 下次自动动作预告：把所有定时/条件动作算出来按时间排 */
+/** 下次自动动作预告（瘦身版）：只剩份内的两件事——到期登记、限流恢复探测 */
 function buildSchedule() {
   const out = [];
-  const now = new Date();
   const cfg = readJsonSafe(join(WB_DIR, 'free-expiry.json'), { entries: [] });
   const rg = readJsonSafe(join(WB_DIR, '.rate-guard-state.json'), {});
 
-  // 1) 到期自动切换
+  // 1) 到期自动标记
   for (const e of cfg.entries ?? []) {
     if (!e.expiry) continue;
     const exp = new Date(e.expiry).getTime();
     if (exp <= Date.now()) continue;
     out.push({
       at: exp, kind: 'expiry-retire',
-      text: `${e.model}（${e.variant}）到期` + (e.autoRetire ? ' → 自动改 litellm 权重挪走' : ' → 仅通知（不自动切）'),
-      auto: e.autoRetire === true,
+      text: `${e.model}（${e.variant}）免费到期 → 标记"已到期"并记时间线`,
+      auto: true,
     });
     // 预告时间点
     for (const mins of e.notifyBeforeMinutes ?? []) {
       const t = exp - mins * 60000;
       if (t > Date.now()) {
-        out.push({ at: t, kind: 'expiry-notice', text: `${e.model} 到期前 ${mins >= 1440 ? Math.round(mins / 1440) + ' 天' : Math.round(mins / 60) + ' 小时'}预告（私聊）`, auto: true });
+        out.push({ at: t, kind: 'expiry-notice', text: `${e.model} 到期前 ${mins >= 1440 ? Math.round(mins / 1440) + ' 天' : Math.round(mins / 60) + ' 小时'}预告（记时间线）`, auto: true });
       }
     }
   }
-  // 2) 时段路由（hy4 夜间 23:00-08:00）
-  const tw = readJsonSafe(join(WB_DIR, 'free-expiry.json'), {});
-  for (const day of [0, 1, 2]) {
-    const base = new Date(now); base.setDate(now.getDate() + day);
-    for (const [h, label] of [[23, 'hy4-preview 进池（夜间免费窗口开启，weight 40）'], [8, 'hy4-preview 撤出（白天不烧钱，weight 0）']]) {
-      const t = new Date(base); t.setHours(h, 0, 0, 0);
-      if (t.getTime() > Date.now()) out.push({ at: t.getTime(), kind: 'timewindow', text: label, auto: true });
-    }
-  }
-  // 3) 每日摘要
-  for (const day of [0, 1]) {
-    const t = new Date(now); t.setDate(now.getDate() + day); t.setHours(8, 0, 0, 0);
-    if (t.getTime() > Date.now()) out.push({ at: t.getTime(), kind: 'daily-summary', text: '早 8 点每日摘要（昨天账+到期清单+异常）', auto: true });
-  }
-  // 4) rate-guard 复探
+  // 2) rate-guard 限流恢复探测
   for (const [group, st] of Object.entries(rg)) {
-    if (st?.status === 'moved' && st.resetAt) {
-      out.push({ at: st.resetAt, kind: 'rate-probe', text: `${group} 限流重置时间 → 探测是否恢复，恢复则把 bot 挪回`, auto: true });
+    if (st?.status === 'rate-limited' && st.resetAt) {
+      out.push({ at: st.resetAt, kind: 'rate-probe', text: `${group} 限流重置 → 自动探测是否恢复，恢复记时间线`, auto: true });
     }
-  }
-  // 5) 兜底自检（每周）
-  const hc = readJsonSafe(join(WB_DIR, '.free-expiry-state.json'), {});
-  if (hc.healthCheck?.lastAt) {
-    out.push({ at: hc.healthCheck.lastAt + 7 * 86400000, kind: 'health-check', text: '兜底链健康自检（claude/codex/A 组各打一发）', auto: true });
   }
   return out.filter((x) => x.at > Date.now()).sort((a, b) => a.at - b.at).slice(0, 25);
 }
 
 /** 服务健康（双证据：日志活跃度 + 进程锁）
- * 🔴 教训：① 不能只看日志——alert-push 无告警时静默几分钟很正常；
+ * 🔴 教训：① 不能只看日志——有些模块没活干时静默几分钟很正常；
  *   ② 不能只查进程——PowerShell 里 Get-Process/Get-CimInstance 在这个服务环境下
  *   匹配 CommandLine 极不可靠（2026-10-14 踩过多次）。
  * 折中：日志年龄 < 阈值 = 活跃；超过阈值再尝试用文件锁判断进程是否还在。
@@ -483,7 +492,6 @@ function buildSchedule() {
 function buildHealth() {
   const svcs = [
     { name: 'wb-shim', log: 'logs\\stderr.log', maxQuietMin: 30 },
-    { name: 'wb-alert-push', log: 'logs\\alert-push-stdout.log', maxQuietMin: 180 },
     { name: 'free-expiry', log: 'logs\\free-expiry-stdout.log', maxQuietMin: 15 },
     { name: 'rate-guard', log: 'logs\\rate-guard-stdout.log', maxQuietMin: 120 },
     { name: 'promo-sync', log: 'logs\\promo-sync-stdout.log', maxQuietMin: 90 },
@@ -504,35 +512,18 @@ function buildHealth() {
   });
 }
 
-/** rate-guard 当前状态 */
+/** rate-guard 当前状态（瘦身版：status 只有 ok / rate-limited 两种） */
 function buildRateState() {
   const rg = readJsonSafe(join(WB_DIR, '.rate-guard-state.json'), {});
   return Object.entries(rg).map(([group, st]) => ({
     group,
+    model: st?.model ?? GROUP_MODEL[group] ?? null,
     status: st?.status ?? 'ok',
-    statusText: st?.status === 'moved' ? `已挪到 ${st.movedTo ?? '?'}` : (st?.status === 'fail' ? '救火失败' : '正常'),
-    moved: st?.moved ?? [],
+    statusText: st?.status === 'rate-limited' ? '被限流（哨兵盯着，到点自动探测恢复）' : '正常',
+    since: st?.since ?? null,
     resetAt: st?.resetAt ?? null,
     resetText: st?.resetAt ? new Date(st.resetAt).toLocaleString('zh-CN', { hour12: false }) : null,
   }));
-}
-
-/** 13 个 bot 的模型归属（从配置中心拉，rate-guard 挪完这里能看到最新状态） */
-function buildBotAssignments() {
-  try {
-    const r = execFileSync(
-      'powershell', ['-NoProfile', '-Command',
-      '(Invoke-WebRequest "http://127.0.0.1:13600/api/agents" -TimeoutSec 15 -UseBasicParsing).Content'],
-      { encoding: 'utf8', timeout: 30_000 }
-    );
-    const list = JSON.parse(r);
-    return (Array.isArray(list) ? list : []).map((a) => ({
-      id: a.id,
-      displayName: a.displayName || a.id,
-      provider: a.providerId,
-      model: a.modelId,
-    }));
-  } catch (e) { return null; }
 }
 
 function buildRouterData() {
@@ -566,9 +557,8 @@ function buildRouterData() {
     schedule: buildSchedule(),
     health: buildHealth(),
     rateState: buildRateState(),
-    notifies: readNotifies(120),
+    events: readEvents(120),
     promoSource,
-    botAssignments: buildBotAssignments(),
     credits: live.map((r) => ({ id: r.variant.id, total: r.credits?.unlimited ? '不限' : (r.credits?.total ?? null) })),
   };
 }
@@ -642,10 +632,15 @@ document.getElementById('d').value=today();
 load();
 </script></body></html>`;
 }
+/** 二级页面「模型动态」（2026-10-15 瘦身改名，原「自动化总览」）：
+ * 只显示三块份内事：① 模型状态总览（免费到期 + 限流）② 状态变更时间线 ③ 模块心跳。
+ * 数据全部来自 /api/router（events.jsonl + 两个哨兵状态 + 服务日志年龄）。
+ * 🔴 文案铁律（2026-10-14 老大令）：每个字过一遍"老大能看懂吗"，不用术语。
+ */
 function renderRouterPage() {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>自动化总览 · wb-shim</title><style>
+<title>模型动态 · wb-shim</title><style>
 :root{--brand:#FD9527;--bg:#FFF;--border:#DDD;--surface:#F5F5F5;--text:#333;--text2:#666;--text3:#999;--ok:#0f7b46;--warn:#9a5b00;--err:#c0392b;--font-mono:'IBM Plex Mono',ui-monospace,monospace}
 @media(prefers-color-scheme:dark){:root{--bg:#111;--border:#333;--surface:#1b1b1b;--text:#eee;--text2:#aaa;--text3:#777;--ok:#4ade80;--warn:#fbbf24;--err:#f87171}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,'Segoe UI',system-ui,sans-serif;padding:0 0 3rem}
@@ -664,17 +659,17 @@ tr:last-child td{border-bottom:0}
 .pill.ok{color:var(--ok);border-color:var(--ok)}
 .pill.warn{color:var(--warn);border-color:var(--warn)}
 .pill.err{color:var(--err);border-color:var(--err)}
-.pill.free{background:var(--ok);border-color:var(--ok);color:#fff}
 .mono{font-family:var(--font-mono);font-size:.8rem}
 .muted{color:var(--text3)}
 .note{color:var(--text3);font-size:.76rem;margin-top:.5rem;line-height:1.5}
 .empty{padding:1.2rem;text-align:center;color:var(--text3);font-size:.82rem}
 .bigline{font-size:.95rem;margin:.35rem 0}
 .bigline b{color:var(--brand)}
+.ev{white-space:pre-wrap;font-size:.82rem}
 @media(max-width:600px){th:nth-child(n+4),td:nth-child(n+4){display:none}}
 </style></head><body><div class="wrap">
 <header>
-  <div class="brand"><b>自动化管家</b> · 免费模型都用得怎么样、几点会自动做什么、干过什么</div>
+  <div class="brand"><b>模型动态</b> · 模型上下架、限流、免费到期的记录与当前状态</div>
   <div class="subtle"><a class="back" href="/">← 回模型看板</a> · 每 60 秒自动刷新 · 更新于 <span id="now"></span></div>
 </header>
 <div id="content"><div class="card"><div class="empty">加载中…</div></div></div>
@@ -683,148 +678,99 @@ tr:last-child td{border-bottom:0}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function fmtT(ms){if(!ms)return '-';const d=new Date(ms);const p=(n)=>String(n).padStart(2,'0');return (d.getMonth()+1)+'月'+d.getDate()+'日 '+p(d.getHours())+':'+p(d.getMinutes())}
 function leftText(ms){if(ms<=0)return '已经到期了';const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);if(d>0)return '还能用 '+d+' 天'+(h?' '+h+' 小时':'');if(h>0)return '还能用 '+h+' 小时'+(m?' '+m+' 分':'');return '还剩 '+m+' 分钟'}
+function evText(e){
+  const p=[];
+  if(e.models&&e.models.length)p.push(e.models.join('、'));
+  else if(e.model)p.push(e.model);
+  if(e.variant)p.push('('+e.variant+')');
+  if(e.leftText)p.push('还剩 '+e.leftText);
+  if(e.expiryText)p.push('免费到 '+e.expiryText);
+  if(e.resetAtText)p.push('预计 '+e.resetAtText+' 恢复');
+  if(e.downForMin)p.push('限了 '+e.downForMin+' 分钟');
+  if(e.total!=null)p.push('剩余 '+e.total+' 分');
+  if(e.reason)p.push(e.reason);
+  if(e.note)p.push(e.note);
+  return p.join(' · ')||'-';
+}
 async function load(){
   let d;try{d=await(await fetch('/api/router',{cache:'no-store'})).json()}catch(e){document.getElementById('content').innerHTML='<div class="card"><div class="empty">加载失败：'+esc(e.message)+'</div></div>';return}
   document.getElementById('now').textContent=fmtT(d.now);
   const H=[];
-  const modelCn={'step-5-preview':'阶跃 Step5（国内版）','step-5-preview-intl':'阶跃 Step5（国际版）','deepseek-v4.1-flash-intl':'DeepSeek v4.1 极速版（国际）','hy3':'腾讯混元 Hy3（国内）','hy3-intl':'腾讯混元 Hy3（国际）','hy4-preview':'腾讯混元 Hy4（夜间免费）'};
+  const modelCn={'step-5-preview':'阶跃 Step5（国内版）','step-5-preview-intl':'阶跃 Step5（国际版）','deepseek-v4.1-flash-intl':'DeepSeek v4.1 极速版（国际）','hy3':'腾讯混元 Hy3（国内）','hy3-intl':'腾讯混元 Hy3（国际）','hy4-preview':'腾讯混元 Hy4','glm-5.3-flash':'GLM 5.3 极速'};
   const mc=(m)=>modelCn[m]||m;
 
   /* ① 一句话总结 */
   const free=d.freeModels.filter(m=>!m.expired);
   const expired=d.freeModels.filter(m=>m.expired);
-  const limited=(d.rateState||[]).filter(r=>r.status==='moved'||r.status==='fail');
+  const limited=(d.rateState||[]).filter(r=>r.status==='rate-limited');
   let sum;
   if(limited.length){
-    sum='⚠️ 有 '+limited.length+' 个模型被官方限流了。系统已经自动把机器人挪到还能用的模型上，'+fmtT(limited[0].resetAt||d.now)+' 左右会自动恢复，不用管。';
+    sum='⚠️ 有 '+limited.length+' 个模型正被官方限流。'+limited.map(l=>esc(mc(l.model||l.group))).join('、')+'，预计 '+fmtT(limited[0].resetAt||d.now)+' 左右恢复，哨兵会自动探测并记录。';
   }else if(free.length){
     const next=free.reduce((a,b)=>a.leftMs<b.leftMs?a:b);
-    sum='✅ 一切正常。'+free.length+' 个免费模型都能用，其中 '+esc(mc(next.upstreamModel||next.model))+' 最早到期（'+leftText(next.leftMs)+'），到期前系统会自动处理并通知你。';
+    sum='✅ 一切正常。'+free.length+' 个免费模型都能用，其中 '+esc(mc(next.upstreamModel||next.model))+' 最早到期（'+leftText(next.leftMs)+'），到期前系统会记录并标记。';
   }else{
-    sum='⚠️ 免费模型全部到期了，机器人正在用备用渠道干活（可能花钱）。';
+    sum='⚠️ 登记的免费模型全部到期了（详见下方状态表）。';
   }
   H.push('<div class="card"><h2>一句话总结</h2><div class="bigline">'+sum+'</div></div>');
 
-  /* ① 机器人按模型组合并显示（13 行太罗嗦，聚合后一目了然） */
-  H.push('<div class="card"><h2>机器人都用哪些模型<h2 class="q">被限流挪走的机器人，这里显示的是它现在顶替用的模型</h2></h2>');
-  const ba=d.botAssignments;
-  if(!ba||!ba.length)H.push('<div class="empty">读不到机器人名单（配置中心没响应？）</div>');
-  else{
-    const grpCn={'wb-dsv4.1fin':'DeepSeek v4.1 极速（国际·免费）','wb-st5pcn':'阶跃Step5（国内·免费）','wb-st5pin':'阶跃Step5（国际·免费）','wb-hy3':'混元Hy3（国际·免费）','wb-glm5.3f':'GLM5.3f（付费×0.06）','claude-model':'DeepSeek v4.1 极速（国际·免费）','codex-model':'DeepSeek v4.1 极速（国际·免费）','hy3':'混元Hy3（dsh 专用直连）'};
-    const byModel={};
-    for(const b of ba){
-      const cn=grpCn[b.model]||b.model;
-      (byModel[cn]=byModel[cn]||{bots:[],raw:b.model}).bots.push(b.displayName);
-    }
-    H.push('<table><thead><tr><th>用的模型</th><th>哪些机器人</th><th>数量</th></tr></thead><tbody>');
-    for(const [cn,v] of Object.entries(byModel)){
-      H.push('<tr><td><b>'+esc(cn)+'</b><div class="ev" style="color:var(--text3);font-size:.72rem">'+esc(v.raw)+'</div></td><td>'+esc(v.bots.join('、'))+'</td><td><span class="pill">'+v.bots.length+' 个</span></td></tr>');
-    }
-    H.push('</tbody></table>');
-    H.push('<div class="note">限流救火挪走的机器人，这里会实时变成"顶替用的模型"；限流解除后会自动挪回。</div>');
-  }
-  H.push('</div>');
-
-  /* ② 免费模型还能用多久（含时段免费的：hy4 只在夜里免费） */
-  H.push('<div class="card"><h2>免费模型还能用多久<h2 class="q">官方说的截止时间，到期系统自动处理，不用你记</h2></h2>');
+  /* ② 模型状态总览：免费模型 */
+  H.push('<div class="card"><h2>免费模型还能用多久<h2 class="q">官方说的截止时间；到期自动标记"已到期"，官方延期了登记表会自动跟着改</h2></h2>');
   if(!d.freeModels.length)H.push('<div class="empty">没有登记的免费模型</div>');
   else{
-    H.push('<table><thead><tr><th>模型</th><th>免费规则</th><th>免费到</th><th>还剩多久</th><th>到期后系统会</th></tr></thead><tbody>');
+    H.push('<table><thead><tr><th>模型</th><th>免费到</th><th>还剩多久</th><th>状态</th></tr></thead><tbody>');
     for(const m of d.freeModels){
-      const until = String(m.expiry).replace(/T23:59:59\\+08:00/,'').replace(/T00:00:00\\+08:00/,'');
+      const until=String(m.expiry).replace(/T23:59:59\\+08:00/,'').replace(/T00:00:00\\+08:00/,'');
       const cls=m.expired?'err':(m.leftMs<7*864e5?'warn':'ok');
-      // 时段免费的（hy4）：规则里已经写了时段，加粗标红提醒"白天用会花钱"
-      const isTimeWindow = /23:00/.test(m.freeWindow||'');
-      const winHtml = m.freeWindow
-        ? (isTimeWindow
-            ? '<b style="color:var(--warn)">'+esc(m.freeWindow)+'</b><div class="ev" style="color:var(--err);font-size:.72rem">⚠ 白天用这个会扣积分！系统已自动只在夜间启用它</div>'
-            : esc(m.freeWindow))
-        : '全天免费';
-      H.push('<tr><td><b>'+esc(mc(m.upstreamModel||m.model))+'</b><div class="ev" style="color:var(--text3);font-size:.72rem">'+winHtml+'</div></td><td class="mono">'+esc(until)+'</td><td><span class="pill '+cls+'">'+(m.expired?'已到期':leftText(m.leftMs))+'</span></td><td class="ev">'+(m.autoRetire?'自动把用它的机器人挪到备用模型上，并通知你':'只通知你，机器人不用挪')+'</td></tr>');
-    }
-    H.push('</tbody></table>');
-    H.push('<div class="note">日期都是官方说的（官方延期了系统会自动跟着改，不用你提醒）。混元Hy4 是"夜间免费"不是全天免费——白天用它要花钱，系统只在晚上 11 点到早 8 点自动启用它。</div>');
-  }
-  H.push('</div>');
-
-  /* ③ 接下来系统会自动做什么 */
-  H.push('<div class="card"><h2>接下来系统会自动做什么<h2 class="q">都是自动的，你不用记，看看就好</h2></h2>');
-  if(!d.schedule.length)H.push('<div class="empty">暂时没有排好的自动任务</div>');
-  else{
-    H.push('<table><thead><tr><th>什么时候</th><th>做什么</th></tr></thead><tbody>');
-    for(const s of d.schedule.slice(0,10)){
-      const t=s.text
-        .replace(/hy4-preview/g,'混元Hy4')
-        .replace(/进池（夜间免费窗口开启，weight 40）/g,'开始夜间免费（晚上11点到早8点不要钱）')
-        .replace(/撤出（白天不烧钱，weight 0）/g,'退出夜间免费（白天用会花钱，自动停用）')
-        .replace(/早 8 点每日摘要（昨天账\+到期清单\+异常）/g,'给你发一条总结：昨天用了多少、还有什么快到期')
-        .replace(/到期前 (\S+) 预告（私聊）/g,'到期前提醒你（私聊）')
-        .replace(/到期 → 自动改 litellm 权重挪走/g,'到期 → 自动把用它的机器人挪走')
-        .replace(/到期 → 仅通知（不自动切）/g,'到期 → 发通知告诉你')
-        .replace(/限流重置时间 → 探测是否恢复，恢复则把 bot 挪回/g,'试试限流解除了没，解除了就把机器人挪回来');
-      H.push('<tr><td class="mono" style="white-space:nowrap">'+fmtT(s.at)+'</td><td>'+esc(t)+'</td></tr>');
+      const isTimeWindow=/23:00/.test(m.freeWindow||'');
+      const winHtml=m.freeWindow?(isTimeWindow?'<b style="color:var(--warn)">'+esc(m.freeWindow)+'</b>':esc(m.freeWindow)):'';
+      H.push('<tr><td><b>'+esc(mc(m.upstreamModel||m.model))+'</b>'+(winHtml?'<div style="color:var(--text3);font-size:.72rem">'+winHtml+'</div>':'')+'</td><td class="mono">'+esc(until)+'</td><td>'+(m.expired?'—':leftText(m.leftMs))+'</td><td><span class="pill '+cls+'">'+(m.expired?'已到期':'可用')+'</span></td></tr>');
     }
     H.push('</tbody></table>');
   }
   H.push('</div>');
 
-  /* ④ 现在有没有被限流 */
-  H.push('<div class="card"><h2>现在有没有被限流<h2 class="q">免费模型用太猛会被官方临时限制，系统自动救</h2></h2>');
+  /* ② 模型状态总览：限流 */
+  H.push('<div class="card"><h2>现在有没有被限流<h2 class="q">免费模型用太猛会被官方临时限制；哨兵每 5 分钟探一次，撞了/恢复了都记进时间线</h2></h2>');
   const rs=d.rateState||[];
-  const grpModel={'wb-dsv4.1fin':'DeepSeek v4.1 极速（国际）','wb-st5pcn':'阶跃Step5（国内）','wb-st5pin':'阶跃Step5（国际）','wb-hy3':'混元Hy3（国际）','claude-model':'claude组','codex-model':'codex组'};
   if(!rs.length)H.push('<div class="empty">还没有限流监控数据</div>');
   else{
-    H.push('<table><thead><tr><th>组（用的模型）</th><th>状态</th><th>被挪走的机器人</th><th>什么时候恢复</th></tr></thead><tbody>');
+    H.push('<table><thead><tr><th>模型</th><th>状态</th><th>预计恢复</th></tr></thead><tbody>');
     for(const r of rs){
-      const cls=r.status==='ok'?'ok':(r.status==='moved'?'warn':'err');
-      const st=r.status==='ok'?'正常':(r.status==='moved'?'被限流，机器人已挪走':'限流且没救回来');
-      H.push('<tr><td><b>'+esc(grpModel[r.group]||r.group)+'</b><div class="ev" style="color:var(--text3);font-size:.72rem">'+esc(r.group)+'</div></td><td><span class="pill '+cls+'">'+st+'</span></td><td class="ev">'+esc((r.moved||[]).join('、')||'—')+'</td><td class="ev">'+esc(r.resetText||'—')+'</td></tr>');
+      const cls=r.status==='rate-limited'?'err':'ok';
+      H.push('<tr><td><b>'+esc(mc(r.model||r.group))+'</b><div style="color:var(--text3);font-size:.72rem">'+esc(r.group)+'</div></td><td><span class="pill '+cls+'">'+esc(r.statusText)+'</span></td><td class="ev">'+esc(r.resetText||'—')+'</td></tr>');
     }
     H.push('</tbody></table>');
   }
   H.push('</div>');
 
-  /* ⑤ 四个管家还活着吗 */
-  H.push('<div class="card"><h2>自动管家们都活着吗<h2 class="q">哪个停了会自动通知你</h2></h2>');
-  H.push('<table><thead><tr><th>管家</th><th>干的活</th><th>状态</th><th>最近在忙</th></tr></thead><tbody>');
-  const jobs={'wb-shim':'接官方数据、管模型','wb-alert-push':'有情况私聊你','free-expiry':'到期切换/用量监控/每日总结','rate-guard':'被限流时自动救火','promo-sync':'盯着官方有没有改免费日期'};
+  /* ③ 状态变更时间线 */
+  H.push('<div class="card"><h2>状态变更时间线<h2 class="q">模型上下架、限流/恢复、到期/延期、官方改日期——都记在这里</h2></h2>');
+  const ns=d.events||[];
+  if(!ns.length)H.push('<div class="empty">还没有记录</div>');
+  else{
+    const kinds={'model-added':'模型上架','model-removed':'模型下架','rate-limited':'被限流','rate-recovered':'限流恢复','model-expired':'免费到期','expiry-extended':'到期推迟','expiry-notice':'到期预告','promo-update':'官方日期更新','credits-low':'积分低水位'};
+    H.push('<table><thead><tr><th>时间</th><th>事件</th></tr></thead><tbody>');
+    for(const n of ns){
+      const cls=(n.type==='rate-limited'||n.type==='model-expired'||n.type==='credits-low')?'err':(n.type==='model-added'||n.type==='rate-recovered'||n.type==='expiry-extended')?'ok':'';
+      H.push('<tr><td class="mono" style="white-space:nowrap">'+fmtT(n.ts)+'</td><td><span class="pill '+(cls?'':'')+' '+cls+'">'+esc(kinds[n.type]||n.type)+'</span><div class="ev" style="margin-top:.3rem">'+esc(evText(n))+'</div></td></tr>');
+    }
+    H.push('</tbody></table>');
+    H.push('<div class="note">想让这些事件同时推到别处（比如你自己的飞书机器人）？在项目根目录放一个 hooks.json：{"url":"https://…"}，每条事件都会 POST 过去。不配就只记在这里，安静。</div>');
+  }
+  H.push('</div>');
+
+  /* ④ 模块心跳 */
+  H.push('<div class="card"><h2>模块心跳<h2 class="q">盯模型状态的几个后台模块，哪个停了这里直接显示</h2></h2>');
+  H.push('<table><thead><tr><th>模块</th><th>干的活</th><th>状态</th><th>最近在忙</th></tr></thead><tbody>');
+  const jobs={'wb-shim':'模型目录+调用网关（主页那些模型就是它供的）','free-expiry':'到期哨兵：到期/预告记时间线并标状态','rate-guard':'限流哨兵：限流/恢复记时间线并标状态','promo-sync':'盯官方日期：官方改了免费期自动改登记表'};
   for(const s of d.health||[]){
     H.push('<tr><td class="mono">'+esc(s.name)+'</td><td class="ev">'+esc(jobs[s.name]||'')+'</td><td><span class="pill '+(s.alive?'ok':'err')+'">'+(s.alive?'在岗':'停了')+'</span></td><td class="ev">'+esc(s.lastLogText)+'</td></tr>');
   }
   H.push('</tbody></table></div>');
-
-  /* ⑥ 给你发过的通知 */
-  H.push('<div class="card"><h2>给你发过的通知 · 以前干过什么<h2 class="q">从 '+((d.notifies||[]).length ? fmtT(d.notifies[d.notifies.length-1].t) : '—')+' 开始记录的</h2></h2>');
-  const ns=d.notifies||[];
-  if(!ns.length)H.push('<div class="empty">还没有记录</div>');
-  else{
-    H.push('<table><thead><tr><th>时间</th><th>发了什么</th></tr></thead><tbody>');
-    for(const n of ns){
-      const kinds={'rate-moved':'限流救火','rate-recovered':'限流恢复','rate-no-target':'救火失败','promo-update':'官方日期更新','expiry-notice':'到期提醒','retired':'到期已切换','burn-spike':'用量异常','daily-summary':'每日总结','timewindow-on':'夜间免费开启','timewindow-failed':'夜间切换失败','new-model':'发现新模型','promote-ask':'问要不要升级','health-fail':'管家出问题','selftest':'测试'};
-      H.push('<tr><td class="mono" style="white-space:nowrap">'+fmtT(n.t)+'</td><td><span class="pill">'+esc(kinds[n.kind]||n.kind)+'</span><div style="white-space:pre-wrap;margin-top:.3rem">'+esc(String(n.text).slice(0,260))+'</div></td></tr>');
-    }
-    H.push('</tbody></table>');
-  }
-  H.push('</div>');
   document.getElementById('content').innerHTML=H.join('');
 }
 load();setInterval(load,60000);
-function _esc(s){return String(s==null?'':s).replace(/[&<>]/g,function(ch){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[ch]})}
-async function loadBurn(){
-  const el=document.getElementById('burnBody'); if(!el) return;
-  try{
-    const j=await(await fetch('/usage-detail',{cache:'no-store'})).json();
-    if(!j.ok) throw new Error(j.error||'unknown');
-    const rows=[];
-    for(const v of j.variants){
-      rows.push('<b>'+_esc(v.id)+'</b>：<span class="mono">'+v.total+'</span> 分 / '+v.requests+' 次');
-      const top=(v.models||[]).filter(m=>m.credit>0).slice(0,3);
-      for(const m of top){ rows.push('<div class="subtle" style="margin-left:1em">· '+_esc(m.name)+'：'+m.credit.toFixed(2)+' 分（'+m.requests+' 次）</div>'); }
-    }
-    el.innerHTML=rows.join('');
-  }catch(e){ el.textContent='官方账加载失败'; }
-}
-loadBurn(); setInterval(loadBurn,60000);
 </script></body></html>`;
 }
 
@@ -854,6 +800,7 @@ const server = http.createServer(async (req, res) => {
         freeModels: (r.freeIds ?? []),
         alerts: (r.alerts ?? []).slice(-20),
       })),
+      recentEvents: readEvents(30), // 状态变更时间线最近 30 条（events.mjs）
     }, null, 2));
     return;
   }
@@ -908,7 +855,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderUsagePage());
     return;
-  }  // /router：二级页面「自动化总览」——回答三个问题：现在什么状态 / 下次几点干什么 / 以前干过什么
+  }  // /router：二级页面「模型动态」——模型状态总览 / 状态变更时间线 / 模块心跳
   if (req.method === 'GET' && (urlPath === '/router' || urlPath === '/router/')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderRouterPage());
@@ -939,6 +886,16 @@ const server = http.createServer(async (req, res) => {
       });
       return rows.join('\n') || '<tr><td colspan="3" class="tertiary">无分包明细</td></tr>';
     };
+    // 状态徽章数据（2026-10-15 瘦身版）：限流中 / 免费已到期——主页模型信息准确及时
+    const rgState = readJsonSafe(join(WB_DIR, '.rate-guard-state.json'), {});
+    const limitedByModel = new Map();
+    for (const [g, st] of Object.entries(rgState)) {
+      if (st?.status === 'rate-limited') limitedByModel.set(st.model ?? GROUP_MODEL[g] ?? g, st);
+    }
+    const expiryCfg = readJsonSafe(join(WB_DIR, 'free-expiry.json'), { entries: [] });
+    const expiredModels = new Set(
+      (expiryCfg.entries ?? []).filter((e) => e.expiry && new Date(e.expiry).getTime() <= Date.now()).map((e) => e.model)
+    );
     const credCards = live.map((rt) => {
       const c = rt.credits;
       const body = c
@@ -948,7 +905,7 @@ const server = http.createServer(async (req, res) => {
         : `<div class="tertiary">${esc(rt.creditsError ?? '尚未抓取')}</div>`;
       return `<div class="card"><h2>${esc(rt.variant.displayName)} <span class="pill ${rt.catalog.isVisible() ? 'on' : ''}">${rt.catalog.isVisible() ? '已登录' : '未登录'}</span></h2>${body}<div class="subtle">积分更新于 ${esc(fmtTime(rt.creditsAtMs))}</div></div>`;
     }).join('\n');
-    const modelRow = (m, probe, extId) => {
+    const modelRow = (m, probe, extId, badge = '') => {
       const efforts = probe ?? (m.reasoning?.supportedEfforts?.length ? m.reasoning.supportedEfforts.join('/') : (m.reasoning?.supports ? '默认档' : '—'));
       const free = m.billing?.free === true;
       const rateTxt = free ? '免费' : (m.billing?.credits ?? '—');
@@ -957,7 +914,7 @@ const server = http.createServer(async (req, res) => {
       const cw = m.contextWindow ? fmtK(m.contextWindow) : '—';
       const opts = m.supportedContextWindows?.length > 1 ? `<span class="subtle mono">可选 ${m.supportedContextWindows.map(fmtK).join(' / ')}</span>` : '';
       return `<tr data-search="${esc(`${m.name} ${extId} ${m.billing?.credits ?? ''} ${efforts}`)}">
-<td data-sort="${esc(m.name)}"><span class="primary-link">${esc(m.name)}</span>${free ? '<span class="rate free">· 免费</span>' : `<span class="rate mono">· ${esc(rateTxt)}</span>`}<span class="subtle mono">${esc(extId)}</span></td>
+<td data-sort="${esc(m.name)}"><span class="primary-link">${esc(m.name)}</span>${free ? '<span class="rate free">· 免费</span>' : `<span class="rate mono">· ${esc(rateTxt)}</span>`}${badge}<span class="subtle mono">${esc(extId)}</span></td>
 <td data-sort="${m.contextWindow ?? 0}" class="mono num">${cw}${opts}</td>
 <td data-sort="${m.supportsImages ? 'a' : 'b'}">${m.supportsImages ? '<span class="pill on">图+文</span>' : '<span class="pill">仅文</span>'}</td>
 <td data-sort="${esc(efforts)}">${esc(efforts)}</td>
@@ -1003,7 +960,16 @@ const server = http.createServer(async (req, res) => {
           .filter((f) => f.items.length)
           .map(({ k, label, vendor, items }) => `<tbody data-family="${k}">
 <tr class="group"><td colspan="5">${esc(label)}${vendor ? ` <span class="subtle" style="display:inline">· ${esc(vendor)}</span>` : ''}<span class="count">${items.length} 个</span></td></tr>
-${items.map((m) => modelRow(m, probeEffortsFor(m.id, rt.lastIdentity), externalId(rt, m.id))).join('\n')}
+${items.map((m) => {
+  const extId = externalId(rt, m.id);
+  const isLimited = limitedByModel.get(m.id) || limitedByModel.get(extId);
+  const badge = isLimited
+    ? '<span class="pill" style="color:var(--err);border-color:var(--err);margin-left:.4rem">限流中</span>'
+    : (expiredModels.has(m.id) || expiredModels.has(extId))
+      ? '<span class="pill" style="color:var(--warn);border-color:var(--warn);margin-left:.4rem">免费已到期</span>'
+      : '';
+  return modelRow(m, probeEffortsFor(m.id, rt.lastIdentity), extId, badge);
+}).join('\n')}
 </tbody>`)
           .join('\n');
         return { rt, models, families };
@@ -1084,7 +1050,7 @@ td:hover .copy-button{opacity:1}
 footer{color:var(--text3);font-size:.75rem;margin-top:1.25rem}
 .connline{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;margin:.15rem 0}
 </style></head><body>
-<header><div class="brand"><b>wb-shim</b> · WorkBuddy 模型网关${totalCredits ? ` · <span class="pill on">剩余 ${totalCredits} 积分</span>` : ''} · <a class="navbtn" href="/router">⚙ 自动化总览</a></div>
+<header><div class="brand"><b>wb-shim</b> · WorkBuddy 模型网关${totalCredits ? ` · <span class="pill on">剩余 ${totalCredits} 积分</span>` : ''} · <a class="navbtn" href="/router">⚙ 模型动态</a></div>
 <div class="subtle">${esc(acct ? `账号 ${acct.nickname || acct.uid}` : '已登录')} · 数据每 60 秒自动刷新</div></header>
 <div class="wrap">
 <div class="cols">

@@ -1,29 +1,30 @@
 # wb-shim
 
-把 **WorkBuddy 的模型和积分**变成自己人能随便用的本地服务：一个常驻网关（OpenAI 兼容协议），加上一套"积分别白烧、限免别错过"的管家系统。
+把 **WorkBuddy 的模型和积分**变成自己人能随便用的本地服务：一个常驻网关（OpenAI 兼容协议），加上一套"主页模型信息永远准确及时"的自动化哨兵。
 
-> 私有项目 · 单机部署 · 无外部依赖服务（除 WorkBuddy 账号本身）
+> 独立项目 · 单机部署 · 无外部依赖服务（除 WorkBuddy 账号本身）
 
 ## 它解决什么问题
 
 WorkBuddy 官方客户端里有一堆模型（含限免的），但只有客户端能用。wb-shim 做三件事：
 
-1. **模型出墙**：把 WorkBuddy 模型包装成标准 OpenAI 接口，挂在固定端口上。LiteLLM 拿它当上游，下游十几个 AI bot 全部用上 WorkBuddy 的模型——引擎、工具链一行不改，只换模型。
+1. **模型出墙**：把 WorkBuddy 模型包装成标准 OpenAI 接口，挂在固定端口上。任何支持 OpenAI 协议的客户端/LiteLLM 都能拿它当上游——引擎、工具链一行不改，只换模型。
 2. **积分看账**：官方账页只有个总数，wb-shim 把官方计费接口拆开做了自己的明细页——每天谁在烧、烧在哪个模型上、每笔请求多少积分，一眼看到底。
-3. **白嫖管家**：限免模型快到期了提前私聊提醒；官方偷偷延期自动同步进来（官方延期只写在界面里，API 不返回）；免费模型被限流了自动给挂它最多的 bot 换道，不硬撞。
+3. **模型动态**（份内自动化，2026-10-15 定位收窄）：维护主页模型信息的**准确和及时**——模型上架/下架、被限流/恢复、限免到期/官方延期，全部自动探测、记进状态时间线、在页面上标状态徽章。
+
+> 定位铁律：wb-shim 只做份内的事。通知怎么发、下游网关怎么改配置、bot 怎么调度，都是使用者自己的事——本项目只负责把模型状态说准。需要推送？配一个 `hooks.json`（见下），每条状态变更都会 POST 给你自己的接收端。
 
 ## 组成
 
 | 文件 | 干什么 |
 |---|---|
-| `daemon.mjs` | 主服务。固定端口常驻 OpenAI 兼容端点 + 模型目录管理 + 积分余额监控 + 用量明细页。核心逻辑是把官方客户端插件（dsh-workbuddy-connect@0.7.1）的组装流程复刻出来，凭据加密钥匙从插件的分块文件里按名导入——**插件版本锁死 0.7.1，升级要核对分块文件名** |
+| `daemon.mjs` | 主服务。固定端口常驻 OpenAI 兼容端点 + 模型目录管理（上下架自动记时间线）+ 积分余额监控 + 用量明细页 + 状态徽章渲染。核心逻辑是把官方客户端插件（dsh-workbuddy-connect@0.7.1）的组装流程复刻出来，凭据加密钥匙从插件的分块文件里按名导入——**插件版本锁死 0.7.1，升级要核对分块文件名** |
 | `proto-convert.mjs` | 协议转换层。Anthropic Messages / OpenAI Responses 两种协议转成上游只认的 chat/completions，回程再转回来。按路径分流，不按模型分流 |
-| `free-expiry.mjs` | 限免到期管理：到期前 N 天/时/分私聊提醒（人话格式：谁到期、几号、影响谁、打算怎么处理） |
-| `promo-sync.mjs` | 官方促销/限免信息自动同步，治"官方延期读不到"的缺口 |
-| `rate-guard.mjs` | 限流感知自动重排：限流按「账号+模型」维度算，挂的 bot 越多撞得越快——记账、预测、提前换道 |
+| `events.mjs` | 模型状态时间线（唯一事件出口）：所有自动化动作统一记一条 JSONL 事件，可选 webhook 推送 |
+| `rate-guard.mjs` | 限流哨兵：每 5 分钟直探上游（max_tokens=1），撞限流/连续超时挂死 → 记事件 + 状态落盘（首页徽章"限流中"）；到重置时间自动探测恢复 |
+| `free-expiry.mjs` | 到期哨兵：每 5 分钟盘到期登记表，3 天/1 天/6 小时水位预告、到期记事件 + 标"已到期"；官方延期自动解除标记 |
+| `promo-sync.mjs` | 官方促销同步：读 WorkBuddy 客户端缓存的官方产品配置（权威到期时间只写在界面里，API 不返回），每 30 分钟对账登记表 |
 | `usage-log.mjs` | 用量与限流记账：官方不公开限流配额，反代自己记每次请求的 usage，倒推还能用多少 |
-| `alert-push.mjs` | 告警推送：独立进程轮询 `/alerts`，有新告警就用 bot 身份私聊推人。跟主服务分开跑，主服务崩了推送不断 |
-| `notify-log.mjs` | 所有飞书通知的落盘历史（谁、何时、发了什么），JSONL 追加 |
 
 ## HTTP 端点
 
@@ -33,7 +34,8 @@ WorkBuddy 官方客户端里有一堆模型（含限免的），但只有客户�
 | `POST /v1/messages` | Anthropic Messages 协议（自动转换） |
 | `POST /v1/responses` | OpenAI Responses 协议（自动转换） |
 | `GET /healthz` | 免鉴权探活 |
-| `GET /alerts` | 免鉴权只读：限免到期 / 积分低水位 / 新限免上线 |
+| `GET /alerts` | 免鉴权只读：各版积分/用量/免费名单/告警 + 最近 30 条状态事件 |
+| `GET /api/router` | 模型动态页数据接口（状态总览/时间线/心跳） |
 | `GET /usage?date=YYYY-MM-DD` | 按日汇总 + 明细页（带翻页） |
 | `GET /usage-detail?date=` | 按模型聚合的明细 JSON |
 
@@ -45,9 +47,19 @@ WorkBuddy 官方客户端里有一堆模型（含限免的），但只有客户�
 - **单飞**：同一天并发查询只打一次官方接口，其余等结果——看板/告警/明细页撞车不重复烧请求。
 - **启动预取**：后台自动拉最近 7 天账单落盘。
 
+## 通知钩子（可选）
+
+在项目根目录放 `hooks.json`（已 gitignore，不会入库）：
+
+```json
+{ "url": "https://你的接收端/webhook", "secret": "可选，随事件头 X-WB-Shim-Secret 一起发" }
+```
+
+配了之后，每条状态事件（模型上下架/限流恢复/到期延期/官方改日期/积分低水位）都会 POST 一份 JSON 过去；不配就只落盘到 `events.jsonl`，完全安静。事件类型：`model-added` / `model-removed` / `rate-limited` / `rate-recovered` / `model-expired` / `expiry-extended` / `expiry-notice` / `promo-update` / `credits-low`。
+
 ## 界面截图
 
-首页（模型目录：积分余量 / 模型倍率 / 上下文 / 调用 ID）：
+首页（模型目录：积分余量 / 模型倍率 / 上下文 / 调用 ID / 限流与到期状态徽章）：
 
 ![首页](dashboard.png)
 
@@ -55,20 +67,22 @@ WorkBuddy 官方客户端里有一堆模型（含限免的），但只有客户�
 
 ![积分明细页](usage.png)
 
-自动化总览页（`/router`：现在什么状态 / 下次几点干什么 / 以前干过什么，各模块心跳）：
+模型动态页（`/router`：模型状态总览 / 状态变更时间线 / 各哨兵模块心跳）：
 
-![自动化总览](router.png)
+![模型动态](router.png)
 
 ## 不入库的文件（已 gitignore）
 
-`token.txt`、`lark-secret.txt`、`free-expiry.json`、`rate-guard.json`、`logs/` ——凭据和运行状态只留本地。
+`token.txt`、`hooks.json`、`events.jsonl`、`free-expiry.json`、`rate-guard.json`、各 `.*-state.json`、`logs/` ——凭据和运行状态只留本地，拿到项目的人自己填自己的。
 
 ## 运行
 
 ```bash
 pnpm install
 node daemon.mjs          # 主服务
-node alert-push.mjs      # 告警推送（可选，独立进程）
+node rate-guard.mjs      # 限流哨兵
+node free-expiry.mjs     # 到期哨兵
+node promo-sync.mjs      # 官方促销同步（读 WorkBuddy 客户端缓存）
 ```
 
 生产环境用 nssm 注册成 Windows 服务常驻。
