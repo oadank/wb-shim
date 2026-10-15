@@ -15,5 +15,6 @@ logs/
 *.bak*
 *.testbak
 
-# 截图
+# 截图（README 引用的界面图例外，其余不入库）
 *.png
+!dashboard*.png
