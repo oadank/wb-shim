@@ -19,3 +19,4 @@ logs/
 *.png
 !dashboard.png
 !usage.png
+!router.png

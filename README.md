@@ -55,6 +55,10 @@ WorkBuddy 官方客户端里有一堆模型（含限免的），但只有客户�
 
 ![积分明细页](usage.png)
 
+自动化总览页（`/router`：现在什么状态 / 下次几点干什么 / 以前干过什么，各模块心跳）：
+
+![自动化总览](router.png)
+
 ## 不入库的文件（已 gitignore）
 
 `token.txt`、`lark-secret.txt`、`free-expiry.json`、`rate-guard.json`、`logs/` ——凭据和运行状态只留本地。
