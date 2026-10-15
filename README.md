@@ -47,9 +47,13 @@ WorkBuddy 官方客户端里有一堆模型（含限免的），但只有客户�
 
 ## 界面截图
 
-![用量明细页](dashboard.png)
+首页（模型目录：积分余量 / 模型倍率 / 上下文 / 调用 ID）：
 
-![看板](dashboard2.png)
+![首页](dashboard.png)
+
+积分明细页（`/usage`：官方账按模型聚合，可翻历史日期）：
+
+![积分明细页](usage.png)
 
 ## 不入库的文件（已 gitignore）
 

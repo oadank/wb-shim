@@ -17,4 +17,5 @@ logs/
 
 # 截图（README 引用的界面图例外，其余不入库）
 *.png
-!dashboard*.png
+!dashboard.png
+!usage.png
