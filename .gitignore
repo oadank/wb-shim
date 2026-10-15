@@ -1,0 +1,19 @@
+# 凭据（铁律：永不入库）
+token.txt
+lark-secret.txt
+
+# 运行产物
+node_modules/
+logs/
+*.log
+
+# 状态/数据文件（运行时生成，含配置快照）
+*.json
+!package.json
+
+# 测试备份
+*.bak*
+*.testbak
+
+# 截图
+*.png

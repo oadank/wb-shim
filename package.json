@@ -1,0 +1,18 @@
+{
+  "name": "wb-shim",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "dsh-workbuddy-connect": "0.7.1"
+  },
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "devDependencies": {},
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
