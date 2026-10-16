@@ -20,6 +20,8 @@ import {
   createWorkBuddyShim,
 } from 'dsh-workbuddy-connect';
 
+import { execSync } from 'node:child_process';
+
 // 未导出（exports 地图挡了子路径）→ 按 file URL 直 import 分块文件，绕过 exports；
 // 解析 URL 与主包内部引用一致 ⇒ 同一模块实例。`b` 是 0.7.1 的压缩导出名
 // （index.js:1 `import { b as atRestKeyProviderFor }`），升级需核对。
@@ -489,6 +491,15 @@ function buildSchedule() {
  *   匹配 CommandLine 极不可靠（2026-10-14 踩过多次）。
  * 折中：日志年龄 < 阈值 = 活跃；超过阈值再尝试用文件锁判断进程是否还在。
  */
+
+/** 查 nssm 服务是否真在跑（比日志年龄可靠）：sc query 输出含 RUNNING 即活 */
+function svcRunning(name) {
+  try {
+    const out = execSync(`sc query "${name}"`, { windowsHide: true, timeout: 5000 }).toString();
+    return /STATE\s*:\s*\d+\s+RUNNING/.test(out);
+  } catch { return false; }
+}
+
 function buildHealth() {
   const svcs = [
     { name: 'wb-shim', log: 'logs\\stderr.log', maxQuietMin: 30 },
@@ -505,7 +516,7 @@ function buildHealth() {
       name: s.name,
       lastLogAt: mtime || null,
       lastLogText: mtime ? new Date(mtime).toLocaleString('zh-CN', { hour12: false }) : '无日志',
-      alive: quietMin === null ? false : quietMin < s.maxQuietMin,
+      alive: svcRunning(s.name),
       quietMin,
       maxQuietMin: s.maxQuietMin,
     };
@@ -515,7 +526,7 @@ function buildHealth() {
 /** rate-guard 当前状态（瘦身版：status 只有 ok / rate-limited 两种） */
 function buildRateState() {
   const rg = readJsonSafe(join(WB_DIR, '.rate-guard-state.json'), {});
-  return Object.entries(rg).map(([group, st]) => ({
+  const list = Object.entries(rg).map(([group, st]) => ({
     group,
     model: st?.model ?? GROUP_MODEL[group] ?? null,
     status: st?.status ?? 'ok',
@@ -524,6 +535,17 @@ function buildRateState() {
     resetAt: st?.resetAt ?? null,
     resetText: st?.resetAt ? new Date(st.resetAt).toLocaleString('zh-CN', { hour12: false }) : null,
   }));
+  // 🔴 按上游模型去重：同一 model 的多个 litellm 组名（如 wb-st5pcn / wb-step5 同指 step-5-preview）
+  // 只显示一行，模型名用 modelCn 映射（不暴露 litellm 内部组名）。多组都限流则取较晚的预计恢复。
+  const byModel = new Map();
+  for (const r of list) {
+    const key = r.model || r.group;
+    const prev = byModel.get(key);
+    if (!prev) { byModel.set(key, r); continue; }
+    if (r.status !== 'rate-limited') continue;
+    if (prev.status !== 'rate-limited' || (r.resetAt || 0) > (prev.resetAt || 0)) byModel.set(key, r);
+  }
+  return [...byModel.values()];
 }
 
 function buildRouterData() {
@@ -705,7 +727,8 @@ async function load(){
   const limited=(d.rateState||[]).filter(r=>r.status==='rate-limited');
   let sum;
   if(limited.length){
-    sum='⚠️ 有 '+limited.length+' 个模型正被官方限流。'+limited.map(l=>esc(mc(l.model||l.group))).join('、')+'，预计 '+fmtT(limited[0].resetAt||d.now)+' 左右恢复，哨兵会自动探测并记录。';
+    const etaTxt = limited[0]?.resetAt ? fmtT(limited[0].resetAt)+' 左右恢复' : '恢复时间待哨兵拿到官方响应后更新';
+    sum='⚠️ 有 '+limited.length+' 个模型正被官方限流：'+limited.map(l=>esc(mc(l.model||l.group))).join('、')+'，'+etaTxt+'，哨兵每 5 分钟自动探测。';
   }else if(free.length){
     const next=free.reduce((a,b)=>a.leftMs<b.leftMs?a:b);
     sum='✅ 一切正常。'+free.length+' 个免费模型都能用，其中 '+esc(mc(next.upstreamModel||next.model))+' 最早到期（'+leftText(next.leftMs)+'），到期前系统会记录并标记。';
@@ -738,7 +761,7 @@ async function load(){
     H.push('<table><thead><tr><th>模型</th><th>状态</th><th>预计恢复</th></tr></thead><tbody>');
     for(const r of rs){
       const cls=r.status==='rate-limited'?'err':'ok';
-      H.push('<tr><td><b>'+esc(mc(r.model||r.group))+'</b><div style="color:var(--text3);font-size:.72rem">'+esc(r.group)+'</div></td><td><span class="pill '+cls+'">'+esc(r.statusText)+'</span></td><td class="ev">'+esc(r.resetText||'—')+'</td></tr>');
+      H.push('<tr><td><b>'+esc(mc(r.model||r.group))+'</b></td><td><span class="pill '+cls+'">'+esc(r.statusText)+'</span></td><td class="ev">'+esc(r.resetText||'官方时间待确认')+'</td></tr>');
     }
     H.push('</tbody></table>');
   }
@@ -1363,6 +1386,9 @@ loadBurn(); setInterval(loadBurn,60000);
       const upstreamBuf = Buffer.from(JSON.stringify(upstreamBody));
       const target = rt._pluginShim;
       const u = new URL(req.url, target.baseUrl());
+      // 超时/中止控制：硬超时触发后阻断下游再写 res（避免与挂死的 proxyRes 流冲突）
+      const ctrl = { aborted: false };
+      let proxyResRef = null;
       const proxyReq = http.request(u, {
         method: 'POST',
         headers: {
@@ -1374,7 +1400,22 @@ loadBurn(); setInterval(loadBurn,60000);
           authorization: `Bearer ${target.token()}`,
         },
       });
+      // 🔴 上游无响应兜底：若 shim 在时限内完全不返回（真·挂死），主动掐断并向上游
+      // 调用方返 429（限流语义，而非 504），让调用方正确退避而非狂重试。
+      // 注：限流时上游实际会返 429，真正让它挂死的是响应体管道笔误（已修 proxyRes.pipe(res)）；
+      // 此兜底仅针对「完全无响应」场景，避免真实用户/探针被卡 200s+。
+      proxyReq.setTimeout(Number(process.env.WB_SHIM_UPSTREAM_TIMEOUT_MS || 60000), () => {
+        console.error(`[wb-shim] 上游超时(${process.env.WB_SHIM_UPSTREAM_TIMEOUT_MS || 60000}ms): ${upstreamId} ⇒ 返 429（疑似限流）`);
+        proxyReq.destroy();
+        if (!res.headersSent) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '3600' });
+          res.end(JSON.stringify({ error: { message: 'upstream timeout：workbuddy 上游未在时限内响应，疑似限流中（无官方重置时间，哨兵每轮复探）', type: 'rate_limit_timeout', code: 'rate_limit_timeout' } }));
+        } else res.end();
+      });
       proxyReq.on('response', (proxyRes) => {
+        // 已拿到响应：取消请求级超时，避免慢速 SSE 流被误掐（剩下交给读取侧）
+        proxyReq.setTimeout(0);
+        proxyResRef = proxyRes;
         const status = proxyRes.statusCode || 502;
         const isSse = (proxyRes.headers['content-type'] || '').includes('text/event-stream');
         if (status !== 200 || !isSse || wantStream) {
@@ -1398,7 +1439,7 @@ loadBurn(); setInterval(loadBurn,60000);
               if (crm) recordCredit(upstreamId, { credit: Number(crm[1]) || 0, prompt_tokens: pm ? Number(pm[1]) : 0, completion_tokens: cm ? Number(cm[1]) : 0 });
             });
           }
-          res.pipe(res);
+          proxyRes.pipe(res);
           return;
         }
         // 聚合 SSE → chat.completion JSON
@@ -1431,6 +1472,7 @@ loadBurn(); setInterval(loadBurn,60000);
           }
         });
         proxyRes.on('end', () => {
+          if (ctrl.aborted) return;
           const message = { role: 'assistant', content: content || null };
           if (reasoning) message.reasoning_content = reasoning;
           if (toolCalls.length) message.tool_calls = toolCalls;
@@ -1455,6 +1497,20 @@ loadBurn(); setInterval(loadBurn,60000);
         } else res.end();
       });
       proxyReq.end(upstreamBuf);
+      // 🔴 全局硬超时：覆盖「上游完全无响应」与「返 200 但 SSE 流不结束」两类挂死，
+      // 60s 内强制结束并返 429（限流语义），杜绝真实用户/探针被卡。res 结束即清。
+      const hardTimer = setTimeout(() => {
+        ctrl.aborted = true;
+        console.error(`[wb-shim] 上游硬超时(60s): ${upstreamId} ⇒ 返 429（疑似限流）`);
+        try { proxyReq.destroy(); } catch {}
+        try { proxyResRef?.destroy(); } catch {}
+        if (!res.headersSent) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '3600' });
+          res.end(JSON.stringify({ error: { message: 'upstream timeout：workbuddy 上游未在时限内响应，疑似限流中（无官方重置时间，哨兵每轮复探）', type: 'rate_limit_timeout', code: 'rate_limit_timeout' } }));
+        }
+      }, Number(process.env.WB_SHIM_UPSTREAM_TIMEOUT_MS || 60000));
+      res.on('finish', () => clearTimeout(hardTimer));
+      res.on('close', () => clearTimeout(hardTimer));
       } catch (e) {
         // 转发构造期炸了（路由/URL/headers）：给客户端一个明确的 502，别挂死
         log('chat 转发构造异常:', e?.stack || String(e));

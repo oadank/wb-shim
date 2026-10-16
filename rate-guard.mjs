@@ -26,7 +26,7 @@ const PROBE_MS = Number(process.env.RATE_GUARD_PROBE_MS || 5 * 60 * 1000);
 const PROBE_TIMEOUT_MS = Number(process.env.RATE_GUARD_TIMEOUT_MS || 60_000);
 // step-5 系又慢又爱思考，max_tokens=1 也常要 20~40 秒；单独更长超时防误判
 //（2026-10-14 实测踩过：wb-st5pin 40s 超时误报）
-const SLOW_GROUP_TIMEOUT_MS = Number(process.env.RATE_GUARD_SLOW_TIMEOUT_MS || 120_000);
+const SLOW_GROUP_TIMEOUT_MS = Number(process.env.RATE_GUARD_SLOW_TIMEOUT_MS || 180_000);
 const SLOW_GROUPS = new Set(['wb-st5pcn', 'wb-st5pin', 'wb-step5', 'wbi-step5']);
 function timeoutFor(group) { return SLOW_GROUPS.has(group) ? SLOW_GROUP_TIMEOUT_MS : PROBE_TIMEOUT_MS; }
 
@@ -127,7 +127,7 @@ async function checkOnce(state) {
         st.since = null;
       } else {
         log(`${g.group} 重置时间到了但仍未恢复：${p.reason}`);
-        st.resetAt = p.resetAt || (now + 30 * 60 * 1000);
+        st.resetAt = p.resetAt || null;
       }
       continue;
     }
@@ -147,7 +147,8 @@ async function checkOnce(state) {
       }
       log(`${g.group} 连续 ${TIMEOUT_STRIKES} 次探测超时 ⇒ 判定挂死`);
       p.rateLimited = true;
-      p.resetAt = now + 30 * 60 * 1000;
+      // 🔴 超时=拿不到 429 文本里的官方重置时间 ⇒ 诚实地置 null，绝不能 now+30min 瞎猜
+      p.resetAt = null;
     } else {
       st.timeouts = 0;
     }
