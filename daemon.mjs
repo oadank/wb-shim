@@ -399,16 +399,14 @@ if (!live.length) {
 const WB_DIR = HERE; // 与 daemon 同目录（C:\D\opt\wb-shim）
 // 组名 → 上游模型名（与 rate-guard.mjs upstreamOf 同源；限流状态卡片/首页徽章用）
 const GROUP_MODEL = {
-  'wb-dsv4.1fin': 'deepseek-v4.1-flash-intl',
-  'wbi-dsv4.1fi': 'deepseek-v4.1-flash-intl',
-  'wb-st5pcn': 'step-5-preview',
-  'wb-st5pin': 'step-5-preview-intl',
-  'wb-hy3': 'hy3-intl',
-  'wb-hy3cn': 'hy3',
-  'wb-step5': 'step-5-preview',
-  'wb-glm5.3f': 'glm-5.3-flash',
-  'wb-hy4-preview': 'hy4-preview',
-  'wb-hy4-preview-intl': 'hy4-preview',
+  // 组名即上游真名（2026-10-16 解耦：弃用 litellm 的 wb- 组名风格），保留映射以兼容显示/去重逻辑
+  'step-5-preview': 'step-5-preview',
+  'step-5-preview-intl': 'step-5-preview-intl',
+  'deepseek-v4.1-flash-intl': 'deepseek-v4.1-flash-intl',
+  'hy3': 'hy3',
+  'hy3-intl': 'hy3-intl',
+  'hy4-preview': 'hy4-preview',
+  'hy4-preview-intl': 'hy4-preview',
 };
 function readJsonSafe(p, fallback) {
   try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return fallback; }
@@ -535,8 +533,7 @@ function buildRateState() {
     resetAt: st?.resetAt ?? null,
     resetText: st?.resetAt ? new Date(st.resetAt).toLocaleString('zh-CN', { hour12: false }) : null,
   }));
-  // 🔴 按上游模型去重：同一 model 的多个 litellm 组名（如 wb-st5pcn / wb-step5 同指 step-5-preview）
-  // 只显示一行，模型名用 modelCn 映射（不暴露 litellm 内部组名）。多组都限流则取较晚的预计恢复。
+  // 🔴 按上游模型去重：同一 model 多组只显示一行（step5 已合并单组）。模型名用 modelCn 映射（不暴露内部组名）。多组都限流则取较晚的预计恢复。
   const byModel = new Map();
   for (const r of list) {
     const key = r.model || r.group;
@@ -718,7 +715,7 @@ async function load(){
   let d;try{d=await(await fetch('/api/router',{cache:'no-store'})).json()}catch(e){document.getElementById('content').innerHTML='<div class="card"><div class="empty">加载失败：'+esc(e.message)+'</div></div>';return}
   document.getElementById('now').textContent=fmtT(d.now);
   const H=[];
-  const modelCn={'step-5-preview':'阶跃 Step5（国内版）','step-5-preview-intl':'阶跃 Step5（国际版）','deepseek-v4.1-flash-intl':'DeepSeek v4.1 极速版（国际）','hy3':'腾讯混元 Hy3（国内）','hy3-intl':'腾讯混元 Hy3（国际）','hy4-preview':'腾讯混元 Hy4','glm-5.3-flash':'GLM 5.3 极速'};
+  const modelCn={'step-5-preview':'阶跃 Step5（国内版）','step-5-preview-intl':'阶跃 Step5（国际版）','deepseek-v4.1-flash-intl':'DeepSeek v4.1 极速版（国际）','hy3':'腾讯混元 Hy3（国内）','hy3-intl':'腾讯混元 Hy3（国际）','hy4-preview':'腾讯混元 Hy4（国内）','glm-5.3-flash':'GLM 5.3 极速'};
   const mc=(m)=>modelCn[m]||m;
 
   /* ① 一句话总结 */

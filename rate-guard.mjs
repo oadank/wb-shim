@@ -27,7 +27,7 @@ const PROBE_TIMEOUT_MS = Number(process.env.RATE_GUARD_TIMEOUT_MS || 60_000);
 // step-5 系又慢又爱思考，max_tokens=1 也常要 20~40 秒；单独更长超时防误判
 //（2026-10-14 实测踩过：wb-st5pin 40s 超时误报）
 const SLOW_GROUP_TIMEOUT_MS = Number(process.env.RATE_GUARD_SLOW_TIMEOUT_MS || 180_000);
-const SLOW_GROUPS = new Set(['wb-st5pcn', 'wb-st5pin', 'wb-step5', 'wbi-step5']);
+const SLOW_GROUPS = new Set(['step-5-preview', 'step-5-preview-intl']);
 function timeoutFor(group) { return SLOW_GROUPS.has(group) ? SLOW_GROUP_TIMEOUT_MS : PROBE_TIMEOUT_MS; }
 
 const log = (...a) => console.log(new Date().toISOString(), '[rate-guard]', ...a);
@@ -41,21 +41,10 @@ function getWbToken() {
   return wbToken;
 }
 
-/** 组名 → 上游模型名（探针用真名打上游） */
+/** 组名即上游模型名：wb-shim 上游直通，探针用组名直接打上游（不再夹 litellm 的 wb- 组名风格） */
 function upstreamOf(group) {
-  const map = {
-    'wb-dsv4.1fin': 'deepseek-v4.1-flash-intl',
-    'wbi-dsv4.1fi': 'deepseek-v4.1-flash-intl',
-    'wb-st5pcn': 'step-5-preview',
-    'wb-st5pin': 'step-5-preview-intl',
-    'wb-hy3': 'hy3-intl',
-    'wb-hy3cn': 'hy3',
-    'wb-step5': 'step-5-preview',
-    'wb-glm5.3f': 'glm-5.3-flash',
-    'wb-hy4-preview': 'hy4-preview',
-    'wb-hy4-preview-intl': 'hy4-preview',
-  };
-  return map[group] || null;
+  // 组名本身已是上游真名（step-5-preview / deepseek-v4.1-flash-intl / hy4-preview / hy3-intl）
+  return group || null;
 }
 
 async function probe(group) {
