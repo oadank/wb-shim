@@ -26,6 +26,12 @@
       "fallbacks": ["deepseek-v4.1-flash-intl", "hy3-intl"]
     },
     {
+      "group": "glm-5.3-flash",
+      "desc": "GLM 5.3 极速（付费 x0.06；2026-10-19 老大遇 N5105 上'模型繁忙'429 时补册，此前不在盯梢名单）",
+      "bots": [],
+      "fallbacks": ["hy3-intl", "deepseek-v4.1-flash-intl"]
+    },
+    {
       "group": "hy3-intl",
       "desc": "hy3 国际免费组（头号备用源，无固定 bot）",
       "bots": [],

@@ -270,19 +270,24 @@ const parseResetAt = (text) => {
   return Number.isFinite(d.getTime()) ? d.getTime() : null;
 };
 // 代理层真实流量吃到 429 → 就地按 account:model 写限流状态（第一手、零额外探测；恢复由 rate-guard 到点复测）
+// [2026-10-19 老大钦定：429 即标记] 旧逻辑"无官方重置时间就不记"导致 glm-5.3-flash 在 N5105 上
+// 连续 4 次 429（官方播报"模型繁忙"）全被吞掉，页面完全看不到。现在：
+// - 有官方重置时间 → 记它
+// - 无官方重置时间（如"模型繁忙"/queue.waiting）→ 也记，resetAt=null，页面显"官方时间待确认"，
+//   哨兵按 IDLE_RETRY_MS 后复测；误报由复测自然纠正。
+// 唯一不记的：非 429 响应（由调用方保证只在 429 时进来）。
 function recordProxyRateLimit(acctKey, modelId, body) {
   const resetAt = parseResetAt(body);
-  // 真·配额限流必带官方重置时间（老大：真限流肯定有时间）；没时间多是瞬时/频率限制，不记限流状态
-  if (!resetAt) { console.log(`[wb-shim] 代理 429 但无官方重置时间，疑似瞬时/频率限制，不记限流：${acctKey}:${modelId}`); return; }
   const key = acctKey + ':' + modelId;
   const now = Date.now();
   const state = readJsonSafe(join(WB_DIR, '.rate-guard-state.json'), {});
   const prev = state[key] || {};
   const isNew = prev.status !== 'rate-limited' || (resetAt || 0) !== (prev.resetAt || 0);
-  state[key] = { account: acctKey, model: modelId, status: 'rate-limited', resetAt, since: prev.status === 'rate-limited' ? (prev.since || now) : now, at: now, reason: 'proxy 429', source: 'proxy' };
+  const reason = resetAt ? 'proxy 429' : `proxy 429（无官方重置时间）${String(body || '').slice(0, 80)}`;
+  state[key] = { account: acctKey, model: modelId, status: 'rate-limited', resetAt: resetAt ?? null, since: prev.status === 'rate-limited' ? (prev.since || now) : now, at: now, reason, source: 'proxy' };
   writeJsonSafe(join(WB_DIR, '.rate-guard-state.json'), state);
-  if (isNew) appendEvent('rate-limited', { model: modelId, group: modelId, account: acctKey, accountLabel: acctLabel(acctKey), reason: 'proxy 429', resetAt, resetAtText: resetAt ? fmtTime(resetAt) : null, source: 'proxy' });
-  console.log(`[wb-shim] 代理 429 → 限流状态 ${key} 重置≈${resetAt ? fmtTime(resetAt) : '未知'}`);
+  if (isNew) appendEvent('rate-limited', { model: modelId, group: modelId, account: acctKey, accountLabel: acctLabel(acctKey), reason, resetAt: resetAt ?? null, resetAtText: resetAt ? fmtTime(resetAt) : null, source: 'proxy' });
+  console.log(`[wb-shim] 代理 429 → 限流状态 ${key} 重置≈${resetAt ? fmtTime(resetAt) : '未知（10 分钟后自动复测）'}`);
 }
 
 // 插件推理档位检测记录（~/.dsh/.workbuddy-probe.json v2，按账号分组）——只读展示，本服务不主动探测
