@@ -1369,13 +1369,18 @@ function renderEventsInner() {
   return `<div class="wrap">
 <div id="content"><div class="card"><div class="empty">加载中…</div></div></div>
 <script>(function(){
+// 🔴 前端 script 里禁止调用服务端函数（acctLabel 等）——浏览器里不存在 ⇒ ReferenceError
+// ⇒ load() 中断 ⇒ 页面永远停在"加载中..."（2026-10-19 实测翻车）。账号键→人话名在前端
+// 自带一份；改显示名请同时改 ./accounts.mjs（服务端唯一真源）。
+const ACCT_LABELS={workbuddy:'Lecoo','workbuddy-ai':'Lecoo-intl','workbuddy-deb':'N5105'};
+const acctLabelOf=(k)=>ACCT_LABELS[k]||k;
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function fmtT(ms){if(!ms)return '-';const d=new Date(ms);const p=(n)=>String(n).padStart(2,'0');return d.getFullYear()+'/'+p(d.getMonth()+1)+'/'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
 function leftText(ms){if(ms<=0)return '已经到期了';const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);if(d>0)return '还能用 '+d+' 天'+(h?' '+h+' 小时':'');if(h>0)return '还能用 '+h+' 小时'+(m?' '+m+' 分':'');return '还剩 '+m+' 分钟'}
 function evText(e){
   // 限流/恢复两条按老大钦定格式输出，不拼官方英文原文；账号必标（旧事件缺 accountLabel 用 account 反查）
   const name=e.model||e.group||'';
-  const acctName=e.accountLabel||acctLabel(e.account);
+  const acctName=e.accountLabel||acctLabelOf(e.account);
   const acct=' ( '+acctName+' )';
   if(e.type==='rate-limited'){
     return name+acct+' 限流中，将于 '+(e.resetAt?fmtT(e.resetAt):'时间待确认')+' 解除 · 错误码：429';
@@ -1403,8 +1408,8 @@ async function load(){
   /* ① 一句话总结（结构化排版） */
   const free=d.freeModels.filter(m=>!m.expired);
   const limited=(d.rateState||[]).filter(r=>r.status==='rate-limited');
-  // 账号键 → 人话名统一走 accounts.mjs 真源（2026-10-19 收口）
-  const labelFor = acctLabel;
+  // 账号键 → 人话名：前端本地映射（上面 acctLabelOf），不调服务端函数
+  const labelFor = acctLabelOf;
   let sumHtml;
   if(limited.length){
     const items=limited.map(l=>{
