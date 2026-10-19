@@ -32,6 +32,14 @@ function loadHooks() {
 export function appendEvent(type, payload = {}) {
   const ev = { ts: Date.now(), type, ...payload };
   try {
+    // 🔴 credits-low（积分低水位）只保留最新一条（老大：历史记录不存这个）——先剔旧再写
+    if (type === 'credits-low' && existsSync(EVENTS_FILE)) {
+      try {
+        const old = readFileSync(EVENTS_FILE, 'utf8').split('\n').filter((l) => l.trim());
+        const kept = old.filter((l) => { try { return JSON.parse(l).type !== 'credits-low'; } catch { return true; } });
+        writeFileSync(EVENTS_FILE, kept.length ? kept.join('\n') + '\n' : '', 'utf8');
+      } catch { /* 读盘失败不阻塞本次写入 */ }
+    }
     appendFileSync(EVENTS_FILE, JSON.stringify(ev) + '\n', 'utf8');
   } catch (e) { log('事件写盘失败:', String(e).slice(0, 120)); }
   // 可选 webhook：不阻塞、失败只记日志（通知失败不影响主流程）
