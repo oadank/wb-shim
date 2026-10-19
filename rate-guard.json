@@ -1,0 +1,42 @@
+{
+  "_comment": "限流自动重排配置（2026-10-14 建；2026-10-15 dsh 重写；2026-10-16 解耦：受管组 group 改名用上游模型真名，弃用 litellm 的 wb- 组名风格，wb-shim 这层不再夹 litellm 命名）。受管组=需要盯频率限制的主力组；bots 现在只是备注（运行时以配置中心实时查询为准）；fallbacks=备用组尝试顺序（探针通才用，全不通就不挪，绝不挪进坑里）。挪回逻辑：到重置时间后探测，恢复即挪回。连续 3 次探测超时也按撞墙处理（Step5 系挂死时轮不到 429）。",
+  "groups": [
+    {
+      "group": "step-5-preview",
+      "desc": "阶跃 Step5 国内版（免费，挂死高发组）",
+      "bots": [],
+      "fallbacks": ["hy3-intl", "deepseek-v4.1-flash-intl"]
+    },
+    {
+      "group": "step-5-preview-intl",
+      "desc": "阶跃 Step5 国际版（免费，2026-10-19 补册——此前漏册导致限流了网站不显示）",
+      "bots": [],
+      "fallbacks": ["hy3-intl", "deepseek-v4.1-flash-intl"]
+    },
+    {
+      "group": "deepseek-v4.1-flash-intl",
+      "desc": "DeepSeek v4.1 国际免费组（reasonix/workbuddy/deeptutor 用）",
+      "bots": ["reasonix", "workbuddy", "deeptutor"],
+      "fallbacks": ["hy3-intl", "hy4-preview"]
+    },
+    {
+      "group": "hy4-preview",
+      "desc": "Hy4 国内夜间免费组（hermes 独占，白天 weight=0 自动落国际免费）",
+      "bots": ["hermes"],
+      "fallbacks": ["deepseek-v4.1-flash-intl", "hy3-intl"]
+    },
+    {
+      "group": "hy3-intl",
+      "desc": "hy3 国际免费组（头号备用源，无固定 bot）",
+      "bots": [],
+      "fallbacks": ["deepseek-v4.1-flash-intl", "hy4-preview"]
+    },
+    {
+      "group": "hy3",
+      "desc": "Hy3 国内免费组（客户端官方配额限流，API 探针永远 200 探不到，只看 CDP 播报，哨兵不直探）",
+      "bots": [],
+      "fallbacks": ["hy3-intl", "deepseek-v4.1-flash-intl"],
+      "clientOnly": true
+    }
+  ]
+}

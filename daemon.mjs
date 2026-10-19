@@ -230,6 +230,7 @@ import { readFileSync, writeFileSync, mkdirSync, statSync, readdirSync, existsSy
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendEvent, readEvents } from './events.mjs';
+import { acctLabel, acctKeyOfRuntime } from './accounts.mjs';
 import { recordUsage, recordLimit } from './usage-log.mjs';
 // [2026-10-19] 国际版官方站 fetch failed 修复：Node 24 没有 node:undici 内置模块，
 // wb-shim 也没装 undici 包 ⇒ 走每请求 Connection: close（禁 keep-alive，坏连接不进池）。
@@ -258,8 +259,8 @@ const TOKEN_SRC = TOKENS.map((t) => t.src).join(',');
 const log = (...a) => console.log(new Date().toISOString(), '[wb-shim]', ...a);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtTime = (ms) => (ms ? new Date(ms).toLocaleString('zh-CN', { hour12: false }) : '-');
-// 账号显示名（老大 2026-10-18 定）：本机=Lecoo、Debian=N5105、国际版=Lecoo-intl
-const acctLabel = (k) => (k === 'workbuddy-deb' ? 'N5105' : (k === 'workbuddy-ai' ? 'Lecoo-intl' : 'Lecoo'));
+// 账号显示名统一从 ./accounts.mjs 唯一真源取（2026-10-19 收口，禁止各写一遍）
+const acctLabelOf = acctLabel;
 // 从 429 文本抠官方重置时间（中英文都认），供代理 429 实时记限流状态
 const parseResetAt = (text) => {
   const t = String(text || '');
@@ -344,15 +345,19 @@ async function fetchCreditsEx(rt, credential) {
   const headers = { 'Authorization': `Bearer ${credential.accessToken}`, 'Accept': 'application/json', 'Content-Type': 'application/json' };
   if (credential.uid) headers['X-User-Id'] = credential.uid;
   if (credential.domain) headers['X-Domain'] = credential.domain;
+  // [2026-10-19] 独立连接（禁 keep-alive 池复用坏连接）+ 硬超时。
+  // 根因实录：Clash TUN 劫走官方请求后 socket 崩（UND_ERR_SOCKET），
+  // 池里死连接让后续每次积分请求全挂死，连带 / 和 /api/router 打不开。
+  // 机器没装 undici 包，走每请求 Connection: close（同 fetchUsageDay 的修法）。
   const resp = await fetch(`${base}/v2/billing/meter/get-user-resource`, {
     method: 'POST',
-    headers,
+    headers: { ...headers, Connection: 'close' },
     body: JSON.stringify({
       PageNumber: 1, PageSize: 100, ProductCode: 'p_tcaca', Status: [0, 3],
       PackageEndTimeRangeBegin: fmt(now),
       PackageEndTimeRangeEnd: fmt(new Date(now.getTime() + 3185136e6)),
     }),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(Number(process.env.WB_SHIM_CREDITS_TIMEOUT_MS || 12000)),
   });
   const envelope = await resp.json().catch(() => ({}));
   if (!resp.ok || envelope.code !== 0) throw new Error(`credits HTTP ${resp.status} code=${envelope.code ?? '?'}`);
@@ -414,14 +419,34 @@ async function refreshCredits(rt, credential) {
 
 // [2026-10-16] 积分改为【按需】：只有打开网页 / 调 /v1/credits 才去问服务器一次，带缓存防连点。
 // 取代原来的后台每 REFRESH_MS 轮询（没人看还一直打服务器，像刷分）。
+// [2026-10-19] 积分单飞：同一 rt 的并发请求共享一次官方拉取。
+// 根因实录：/ 和 /api/router 都要 ensureCredits(全账号)，根路径还并发渲染多个栏目，
+// 同一账号一秒内被打 2-4 次（日志同一秒重复"积分: total="），页面被反复拖慢。
+const creditsInflight = new Map();
 async function ensureCredits(rt, force = false) {
   if (!force && rt.creditsAtMs && Date.now() - rt.creditsAtMs < CREDITS_CACHE_TTL_MS) return;
-  try {
-    const cred = await rt.store.resolve();
-    await refreshCredits(rt, cred);
-  } catch (e) {
-    log(rt.variant.id, '按需积分刷新失败（下次再看时重试）:', String(e).slice(0, 180));
+  // [2026-10-19] 失败也要记时间戳（短冷却），否则每次开页面都重打官方——
+  // 官方抽风时积分日志几分钟刷一轮，页面也被反复拖慢。
+  const failCooldownMs = Number(process.env.WB_SHIM_CREDITS_FAIL_COOLDOWN_MS || 30000);
+  if (!force && rt.creditsFailAtMs && Date.now() - rt.creditsFailAtMs < failCooldownMs) return;
+  // 单飞：已在飞的同账号请求直接搭车（force 除外，强制刷新要真打）
+  if (!force) {
+    const flying = creditsInflight.get(rt);
+    if (flying) return flying;
   }
+  const p = (async () => {
+    try {
+      const cred = await rt.store.resolve();
+      await refreshCredits(rt, cred);
+    } catch (e) {
+      rt.creditsFailAtMs = Date.now();
+      log(rt.variant.id, '按需积分刷新失败（下次再看时重试）:', String(e).slice(0, 180));
+    } finally {
+      creditsInflight.delete(rt);
+    }
+  })();
+  creditsInflight.set(rt, p);
+  return p;
 }
 
 /**
@@ -591,8 +616,8 @@ if (DEBIAN_TOKEN) {
 }
 const allRuntimes = [...live, ...debLive];
 // 设备/版本身标签：看板卡片标题统一「名 · 身」，本机/Debian/国际版 一视同仁
-for (const rt of allRuntimes) rt.label = rt.isDebian ? 'N5105' : (rt.variant.id === CN_VARIANT.id ? 'Lecoo' : 'Lecoo-intl');
-// 看板/状态页的账号标识：Debian 用 workbuddy-deb 避免和 LeCoo 的 workbuddy 撞 key（路由仍按 variant.id='workbuddy' 命中 CN）
+// 设备/版本身标签统一走 accounts.mjs 真源（2026-10-19 收口）
+for (const rt of allRuntimes) rt.label = acctLabel(acctKeyOfRuntime(rt, CN_VARIANT.id));// 看板/状态页的账号标识：Debian 用 workbuddy-deb 避免和 LeCoo 的 workbuddy 撞 key（路由仍按 variant.id='workbuddy' 命中 CN）
 const rtLabel = (r) => (r.isDebian ? `${r.variant.id}-deb` : r.variant.id);
 
 // ════════════════════════════════════════════════════════════════
@@ -1095,7 +1120,12 @@ function renderAppShell(defaultView) {
 // JS 每 60s 拉 /usage-detail 把"今天"和趋势补成实时值。
 function renderDashboardInner() {
   // 账号短名：老大一眼认出是哪台（本机=LeCoo / 国际版=WorkBuddy AI / Debian=备用机）
-  const acctShort = (rt) => rt.isDebian ? 'N5105' : (rt.variant.id === CN_VARIANT.id ? 'Lecoo' : 'Lecoo-intl');
+  // 账号短名/标签统一走 accounts.mjs 真源（2026-10-19 收口）
+  // 🔴 TDZ 教训（2026-10-19 实测翻车）：acctKeyOf 的 const 声明在函数后半段，
+  //    箭头函数里引用它 = "Cannot access before initialization"，被 unhandledRejection
+  //    兜底吞掉 → 根路径 / 永远不返回、浏览器干等超时。声明必须早于任何引用。
+  const acctKeyOf = (rt) => acctKeyOfRuntime(rt, CN_VARIANT.id);
+  const acctShort = (rt) => acctLabel(acctKeyOf(rt));
   // [2026-10-18] 汇总所有可见账号积分：总积分 + 按账号分开（老大要看每台各剩多少）
   let creditsUnlimited = false;
   let creditsTotal = 0;
@@ -1126,7 +1156,7 @@ function renderDashboardInner() {
   const limitedSet = new Set(rateState.filter((r) => r.status === 'rate-limited').map((r) => r.model).filter(Boolean));
   const alerts = limitedSet.size;
   // 按账号的限流状态（account:model → 是否限流）：状态表每行只认自己账号的，避免"同模型别账号被限流"误标全账号
-  const acctKeyOf = (rt) => rt.isDebian ? 'workbuddy-deb' : (rt.variant.id === CN_VARIANT.id ? 'workbuddy' : 'workbuddy-ai');
+  // （acctKeyOf 已在函数开头声明，见上方 TDZ 注释）
   const limitedByAcct = new Set(Object.entries(readJsonSafe(join(WB_DIR, '.rate-guard-state.json'), {})).filter(([, st]) => st?.status === 'rate-limited').map(([k]) => k));
 
   const expiryCfg = readJsonSafe(join(WB_DIR, 'free-expiry.json'), { entries: [] });
@@ -1134,8 +1164,8 @@ function renderDashboardInner() {
 
   const modelCn = { 'step-5-preview': '阶跃 Step5（国内版）', 'step-5-preview-intl': '阶跃 Step5（国际版）', 'deepseek-v4.1-flash-intl': 'DeepSeek v4.1 极速版（国际）', 'hy3': '腾讯混元 Hy3（国内）', 'hy3-intl': '腾讯混元 Hy3（国际）', 'hy4-preview': '腾讯混元 Hy4（国内）', 'glm-5.3-flash': 'GLM 5.3 极速' };
   const mc = (m) => modelCn[m] || m;
-  // [2026-10-19] 账号键 → 人话名（排行/明细同源；Debian 与国内版共用 variant.id，只能靠 label 认）
-  const acctCn = { workbuddy: 'Lecoo', 'workbuddy-ai': 'Lecoo-intl', 'workbuddy-deb': 'N5105' };
+  // [2026-10-19] 账号键 → 人话名：统一走 accounts.mjs 真源（别处一律 import，别再抄三目）
+  const acctCn = { workbuddy: acctLabel('workbuddy'), 'workbuddy-ai': acctLabel('workbuddy-ai'), 'workbuddy-deb': acctLabel('workbuddy-deb') };
   const ac = (a) => acctCn[a] || a;
   // [2026-10-19 老大点名] 排行只显示模型原名（上游 id），不套中文译名——
   // 译名把 hy4-preview/glm-5.3-flash 混成同一个观感，反而看不出谁在烧。账号仍用人话名。
@@ -1253,7 +1283,7 @@ async function refresh(){
     const ks=document.getElementById('kpi-req-sub');if(ks)ks.textContent=(todayCredit?fmtN(todayCredit)+' 分':'今天暂无数据');
     const rank=[...byModel.values()].sort((a,b)=>b.requests-a.requests).slice(0,5);const maxR=Math.max(1,...rank.map(r=>r.requests));
     const rc=document.querySelector('.rank');
-    if(rc&&rank.length){const acctCn={workbuddy:'Lecoo','workbuddy-ai':'Lecoo-intl','workbuddy-deb':'N5105'};const ac=(a)=>acctCn[a]||a;rc.innerHTML='<h2>模型调用排行 TOP5（近 7 天 · 按次数）</h2>'+rank.map((r,i)=>{const w=Math.round(r.requests/maxR*100);return '<div class="rank-row"><div class="rank-head"><span class="rank-idx">'+(i+1)+'</span><span class="rank-name" title="'+esc(r.name)+'（'+esc(ac(r.acct))+'）">'+esc(r.name)+'</span><span class="rank-acct">'+esc(ac(r.acct))+'</span><span class="rank-num mono">'+(r.requests||0)+' 次</span></div><div class="rank-bar"><i style="width:'+w+'%"></i></div></div>'}).join('')}
+    if(rc&&rank.length){const ac=(a)=>acctLabel(a);rc.innerHTML='<h2>模型调用排行 TOP5（近 7 天 · 按次数）</h2>'+rank.map((r,i)=>{const w=Math.round(r.requests/maxR*100);return '<div class="rank-row"><div class="rank-head"><span class="rank-idx">'+(i+1)+'</span><span class="rank-name" title="'+esc(r.name)+'（'+esc(ac(r.acct))+'）">'+esc(r.name)+'</span><span class="rank-acct">'+esc(ac(r.acct))+'</span><span class="rank-num mono">'+(r.requests||0)+' 次</span></div><div class="rank-bar"><i style="width:'+w+'%"></i></div></div>'}).join('')}
   }catch(e){}
 }
 var barsBox=document.getElementById('bars');
@@ -1345,7 +1375,7 @@ function leftText(ms){if(ms<=0)return '已经到期了';const d=Math.floor(ms/86
 function evText(e){
   // 限流/恢复两条按老大钦定格式输出，不拼官方英文原文；账号必标（旧事件缺 accountLabel 用 account 反查）
   const name=e.model||e.group||'';
-  const acctName=e.accountLabel||(e.account==='workbuddy-deb'?'N5105':(e.account==='workbuddy-ai'?'Lecoo-intl':'Lecoo'));
+  const acctName=e.accountLabel||acctLabel(e.account);
   const acct=' ( '+acctName+' )';
   if(e.type==='rate-limited'){
     return name+acct+' 限流中，将于 '+(e.resetAt?fmtT(e.resetAt):'时间待确认')+' 解除 · 错误码：429';
@@ -1373,7 +1403,8 @@ async function load(){
   /* ① 一句话总结（结构化排版） */
   const free=d.freeModels.filter(m=>!m.expired);
   const limited=(d.rateState||[]).filter(r=>r.status==='rate-limited');
-  const labelFor=a=>a==='workbuddy-deb'?'N5105':(a==='workbuddy-ai'?'Lecoo-intl':'Lecoo');
+  // 账号键 → 人话名统一走 accounts.mjs 真源（2026-10-19 收口）
+  const labelFor = acctLabel;
   let sumHtml;
   if(limited.length){
     const items=limited.map(l=>{
@@ -1579,7 +1610,8 @@ hb(); setInterval(hb,60000);
 
 // [2026-10-18] 积分页：hero 总览 + 三栏账号卡（大气简单；分包明细去掉横拉滚条）
 function renderCreditsInner() {
-  const acctShort = (rt) => rt.isDebian ? 'N5105' : (rt.variant.id === CN_VARIANT.id ? 'Lecoo' : 'Lecoo-intl');
+  // 账号短名/标签统一走 accounts.mjs 真源（2026-10-19 收口）
+  const acctShort = (rt) => acctLabel(acctKeyOfRuntime(rt, CN_VARIANT.id));
   const fmt2 = (n) => { let s = String(Number(n == null ? 0 : n)); const dot = s.indexOf('.'); if (dot < 0) return s + '.00'; s = s.slice(0, dot + 3); while (s.length < dot + 3) s += '0'; return s; };
   const fmtC = (n) => fmt2(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   const visible = allRuntimes.filter((rt) => rt.catalog.isVisible());
@@ -1651,7 +1683,7 @@ function renderModelsInner() {
   const rgState = readJsonSafe(join(WB_DIR, '.rate-guard-state.json'), {});
   const limitMap = new Map();
   for (const [k, st] of Object.entries(rgState)) { const key = k.indexOf(':') > 0 ? k : 'workbuddy:' + k; limitMap.set(key, st?.status ?? 'ok'); }
-  const acctInfo = (rt) => rt.isDebian ? { label: 'N5105', key: 'workbuddy-deb' } : (rt.variant.id === CN_VARIANT.id ? { label: 'Lecoo', key: 'workbuddy' } : { label: 'Lecoo-intl', key: 'workbuddy-ai' });
+  const acctInfo = (rt) => { const k = acctKeyOfRuntime(rt, CN_VARIANT.id); return { label: acctLabel(k), key: k }; };
   const expiryCfg = readJsonSafe(join(WB_DIR, 'free-expiry.json'), { entries: [] });
   const expiredModels = new Set((expiryCfg.entries ?? []).filter((e) => e.expiry && new Date(e.expiry).getTime() <= Date.now()).map((e) => e.model));
   const fmtK = (n) => n >= 10000 ? `${Math.round(n / 1000)}K` : String(n);
@@ -1901,13 +1933,13 @@ const server = http.createServer(async (req, res) => {
           // 新撞限流（或官方给了更晚的重置时间）才记事件，避免同一播报刷屏时间线
           const isNew = prev.status !== 'rate-limited' || (resetAt || 0) > (prev.resetAt || 0);
           state[key] = { account: 'workbuddy', model: group, status: 'rate-limited', resetAt, since: prev.since || now, at: now, reason, source };
-          if (isNew) appendEvent('rate-limited', { model: GROUP_MODEL[group] ?? group, group, account: 'workbuddy', accountLabel: 'Lecoo', reason, resetAt, resetAtText: resetAt ? fmtTime(resetAt) : null, source });
+          if (isNew) appendEvent('rate-limited', { model: GROUP_MODEL[group] ?? group, group, account: 'workbuddy', accountLabel: acctLabel('workbuddy'), reason, resetAt, resetAtText: resetAt ? fmtTime(resetAt) : null, source });
           log(`[rate-state] 外部种入限流：${key} 重置≈${resetAt ? fmtTime(resetAt) : '未知'}（来源 ${source}）`);
         } else {
           const wasLimited = prev.status === 'rate-limited';
           state[key] = { account: 'workbuddy', model: group, status: 'ok', at: now, source };
           if (wasLimited) {
-            appendEvent('rate-recovered', { model: GROUP_MODEL[group] ?? group, group, account: 'workbuddy', accountLabel: 'Lecoo', source, downForMin: prev.since ? Math.round((now - prev.since) / 60000) : null });
+            appendEvent('rate-recovered', { model: GROUP_MODEL[group] ?? group, group, account: 'workbuddy', accountLabel: acctLabel('workbuddy'), source, downForMin: prev.since ? Math.round((now - prev.since) / 60000) : null });
             log(`[rate-state] 外部标记恢复：${key}（来源 ${source}）`);
           }
         }

@@ -20,6 +20,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendEvent, readJsonSafe, writeJsonSafe } from './events.mjs';
+import { acctLabel, accountsForModelGroup } from './accounts.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CONFIG = join(HERE, 'rate-guard.json');
@@ -47,15 +48,9 @@ function getWbToken() {
 function getDebianToken() { return (process.env.WB_SHIM_DEBIAN_TOKEN || '').trim(); }
 // 账号 → token：本机/国际版都用 LeCoo token（国际版靠 -intl 后缀路由），Debian 用 Debian token
 function tokenFor(acct) { return acct === 'workbuddy-deb' ? getDebianToken() : getWbToken(); }
-function labelFor(acct) { return acct === 'workbuddy-deb' ? 'N5105' : (acct === 'workbuddy-ai' ? 'Lecoo-intl' : 'Lecoo'); }
-/** 账号维度：CN 模型 = Lecoo(本机) + N5105(Debian)；-intl 模型 = Lecoo-intl（一个账号，靠 -intl 后缀路由） */
-function accountsFor(group) {
-  if (String(group).endsWith('-intl')) return [{ key: 'workbuddy-ai', label: 'Lecoo-intl', token: getWbToken() }];
-  const list = [{ key: 'workbuddy', label: 'Lecoo', token: getWbToken() }];
-  const deb = getDebianToken();
-  if (deb) list.push({ key: 'workbuddy-deb', label: 'N5105', token: deb });
-  return list;
-}
+// 账号显示名/账号维度判定统一走 ./accounts.mjs 唯一真源（2026-10-19 收口，禁止各写一遍）
+const labelFor = acctLabel;
+const accountsFor = accountsForModelGroup;
 
 async function probe(token, group) {
   if (!token) return { ok: false, skip: true, reason: '该账号无 token' };
@@ -161,6 +156,8 @@ async function tick(state) {
     const cfg = JSON.parse(readFileSync(CONFIG, 'utf8'));
     for (const g of cfg.groups ?? []) {
       for (const acct of accountsFor(g.group)) {
+        // 没配 Debian token 就跳过 Debian 账号（没凭据探不了，别留空条目）
+        if (acct.key === 'workbuddy-deb' && !getDebianToken()) continue;
         const key = acct.key + ':' + g.group;
         if (!state[key]) state[key] = { account: acct.key, model: g.group, status: 'ok', at: 0 };
       }
