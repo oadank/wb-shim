@@ -103,11 +103,18 @@ function migrate(state) {
     }
   }
 }
-// 读盘合并：daemon 代理 429 会实时写状态进来，按 at 时间戳吃进更新的
+// 读盘合并：daemon 代理 429 会实时写状态进来，按 at 时间戳合并。
+// 🔴 [2026-10-19 修] 必须双向：磁盘上已不存在的键要把内存里的一并删掉。
+// 旧实现只加不删 ⇒ 人工/外部清理掉的脏键，每轮 writeJsonSafe 又原样写回磁盘
+// （实测：删 workbuddy:step-5-preview-intl，60 秒后自己复活，必须重启本服务才清掉）。
+// 现在以磁盘为权威：内存有、磁盘没有 → 删内存；两边都有 → 取 at 较新的。
 function mergeDisk(state) {
   try {
     const disk = readJsonSafe(STATE_FILE, {});
     migrate(disk);
+    for (const k of Object.keys(state)) {
+      if (!(k in disk)) delete state[k];
+    }
     for (const [k, st] of Object.entries(disk)) {
       if (st && (st.at || 0) > (state[k]?.at || 0)) state[k] = st;
     }
@@ -158,6 +165,28 @@ async function tick(state) {
       }
     }
   } catch { /* 配置读失败：按现有 state 继续 */ }
+  // 🔴 [2026-10-19 清脏键] 只保留「配置受管组 × 合法账号」的键。
+  // 背景：/api/rate-state 曾把 -intl 模型记到 workbuddy（国内版）头上（旧代码写死
+  // 'workbuddy:'），产生 workbuddy:step-5-preview-intl 这种脏键；它不在注册表里，
+  // 旧逻辑每轮 writeJsonSafe(state) 原样写回磁盘 ⇒ 人工删了 60 秒又复活。
+  // 现在：每次 tick 先按白名单清洗，脏键立删，并且不再写回。
+  try {
+    const cfg = JSON.parse(readFileSync(CONFIG, 'utf8'));
+    const valid = new Set();
+    for (const g of cfg.groups ?? []) {
+      for (const acct of accountsFor(g.group)) {
+        if (acct.key === 'workbuddy-deb' && !getDebianToken()) continue;
+        valid.add(acct.key + ':' + g.group);
+      }
+    }
+    for (const k of Object.keys(state)) {
+      // 只有带冒号的 account:model 键受管辖；无冒号的老键交给 migrate() 处理
+      if (k.includes(':') && !valid.has(k)) {
+        log(`清掉不合法状态键：${k}（不在受管组×账号白名单）`);
+        delete state[k];
+      }
+    }
+  } catch { /* 配置读失败：不清洗，保守保留 */ }
   const now = Date.now();
   for (const [key, st] of Object.entries(state)) {
     if (!st.model) continue;

@@ -1924,8 +1924,15 @@ const server = http.createServer(async (req, res) => {
       const group = String(body.model || body.group || '').trim();
       const status = body.status === 'ok' ? 'ok' : (body.status === 'rate-limited' ? 'rate-limited' : null);
       if (!group || !status) return fail('需要 model(组名) + status(ok|rate-limited)');
-      // CDP 播报来自本机 LeCoo 客户端 → 记到本机账号键（workbuddy:model），与哨兵本机探针同键按 at 合并
-      const key = 'workbuddy:' + group;
+      // 账号归属（2026-10-19 修）：-intl 后缀模型归国际版（workbuddy-ai），否则归本机 Lecoo。
+      // 旧代码写死 'workbuddy:' —— 国际版模型（如 step-5-preview-intl）会被记到国内版头上，
+      // 页面显示成 "Lecoo" 而不是 "Lecoo-intl"。同 accountsForModelGroup 的账号维度规则。
+      // 也支持调用方显式传 account（client-rate-watch / 人工种入时用）。
+      const acctKey = body.account && ['workbuddy', 'workbuddy-ai', 'workbuddy-deb'].includes(body.account)
+        ? body.account
+        : (String(group).endsWith('-intl') ? 'workbuddy-ai' : 'workbuddy');
+      const key = acctKey + ':' + group;
+      const acctLabelText = acctLabel(acctKey);
       const now = Date.now();
       const resetAt = Number(body.resetAt) > 0 ? Number(body.resetAt) : null;
       try {
@@ -1937,14 +1944,14 @@ const server = http.createServer(async (req, res) => {
         if (status === 'rate-limited') {
           // 新撞限流（或官方给了更晚的重置时间）才记事件，避免同一播报刷屏时间线
           const isNew = prev.status !== 'rate-limited' || (resetAt || 0) > (prev.resetAt || 0);
-          state[key] = { account: 'workbuddy', model: group, status: 'rate-limited', resetAt, since: prev.since || now, at: now, reason, source };
-          if (isNew) appendEvent('rate-limited', { model: GROUP_MODEL[group] ?? group, group, account: 'workbuddy', accountLabel: acctLabel('workbuddy'), reason, resetAt, resetAtText: resetAt ? fmtTime(resetAt) : null, source });
+          state[key] = { account: acctKey, model: group, status: 'rate-limited', resetAt, since: prev.since || now, at: now, reason, source };
+          if (isNew) appendEvent('rate-limited', { model: GROUP_MODEL[group] ?? group, group, account: acctKey, accountLabel: acctLabelText, reason, resetAt, resetAtText: resetAt ? fmtTime(resetAt) : null, source });
           log(`[rate-state] 外部种入限流：${key} 重置≈${resetAt ? fmtTime(resetAt) : '未知'}（来源 ${source}）`);
         } else {
           const wasLimited = prev.status === 'rate-limited';
-          state[key] = { account: 'workbuddy', model: group, status: 'ok', at: now, source };
+          state[key] = { account: acctKey, model: group, status: 'ok', at: now, source };
           if (wasLimited) {
-            appendEvent('rate-recovered', { model: GROUP_MODEL[group] ?? group, group, account: 'workbuddy', accountLabel: acctLabel('workbuddy'), source, downForMin: prev.since ? Math.round((now - prev.since) / 60000) : null });
+            appendEvent('rate-recovered', { model: GROUP_MODEL[group] ?? group, group, account: acctKey, accountLabel: acctLabelText, source, downForMin: prev.since ? Math.round((now - prev.since) / 60000) : null });
             log(`[rate-state] 外部标记恢复：${key}（来源 ${source}）`);
           }
         }
