@@ -1,12 +1,14 @@
 import os
 import paramiko, json, time
 
-# 密码走环境变量，禁止明文入库（.gitignore 另有兜底）
+# 认证：密钥优先，口令兜底（口令只从现成的用户级环境变量 N5105_SSH_PASSWORD 读，禁止明文入库）
 HOST = os.environ.get('N5105_HOST', '100.110.110.12')
 USER = os.environ.get('N5105_USER', 'root')
-PW = os.environ.get('N5105_PASS', '')
-if not PW:
-    raise SystemExit('缺少环境变量 N5105_PASS（N5105 root 密码），拒绝运行')
+KEY = os.environ.get('N5105_SSH_KEY') or os.path.expanduser('~/.ssh/id_rsa_n5105')
+PW = os.environ.get('N5105_SSH_PASSWORD', '')
+USE_KEY = os.path.isfile(KEY)
+if not USE_KEY and not PW:
+    raise SystemExit('既无 SSH 密钥（~/.ssh/id_rsa_n5105）也无环境变量 N5105_SSH_PASSWORD，拒绝运行')
 LOCAL_DEST = r'C:/D/opt/wb-shim/debian-auth.json'
 
 mjs = r'''
@@ -30,7 +32,14 @@ process.stdout.write(JSON.stringify(out, null, 2) + '\n');
 
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect(HOST, username=USER, password=PW, timeout=25)
+connect_kw = dict(hostname=HOST, username=USER, timeout=25)
+if USE_KEY:
+    connect_kw['key_filename'] = KEY
+    print(f'[auth] 使用 SSH 密钥 {KEY}')
+else:
+    connect_kw['password'] = PW
+    print('[auth] 无密钥，回退口令（来自 N5105_SSH_PASSWORD）')
+ssh.connect(**connect_kw)
 sftp = ssh.open_sftp()
 ssh.exec_command('mkdir -p /tmp/wbextract')
 with sftp.open('/tmp/wbextract/extract.mjs', 'w') as f:

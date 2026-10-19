@@ -1,15 +1,22 @@
 import os
 import paramiko
 
-# 密码走环境变量，禁止明文入库（.gitignore 另有兜底）
+# 认证：密钥优先，口令兜底（口令只从现成的用户级环境变量 N5105_SSH_PASSWORD 读，禁止明文入库）
 host = os.environ.get('N5105_HOST', '100.110.110.12')
 user = os.environ.get('N5105_USER', 'root')
-pw = os.environ.get('N5105_PASS', '')
-if not pw:
-    raise SystemExit('缺少环境变量 N5105_PASS（N5105 root 密码），拒绝运行')
+key = os.environ.get('N5105_SSH_KEY') or os.path.expanduser('~/.ssh/id_rsa_n5105')
+pw = os.environ.get('N5105_SSH_PASSWORD', '')
+use_key = os.path.isfile(key)
+if not use_key and not pw:
+    raise SystemExit('既无 SSH 密钥（~/.ssh/id_rsa_n5105）也无环境变量 N5105_SSH_PASSWORD，拒绝运行')
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect(host, username=user, password=pw, timeout=25)
+if use_key:
+    print('[auth] 使用 SSH 密钥', key)
+    ssh.connect(host, username=user, key_filename=key, timeout=25)
+else:
+    print('[auth] 无密钥，回退口令（来自 N5105_SSH_PASSWORD）')
+    ssh.connect(host, username=user, password=pw, timeout=25)
 
 cmd = r'''
 echo "=== OS ==="; head -3 /etc/os-release
