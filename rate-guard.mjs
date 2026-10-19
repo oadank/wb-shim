@@ -123,13 +123,8 @@ async function reprobe(key, st) {
   const token = tokenFor(acct);
   let p = await probe(token, model);
   if (p.skip) return;
-  // 429 复探确认：瞬时 429（burst 抖动）复探即 200，真实限流才持续 429
-  if (!p.ok && p.rateLimited) {
-    const p2 = await probe(token, model);
-    if (p2.ok) p = p2;
-    else if (p2.rateLimited) p = p2;
-    else { log(`${key}（${label}）复测异常（${p2.reason}），稍后再来`); return; }
-  }
+  // [2026-10-19 老大钦定：首探 429 即标记] 复测同理——不再要求"复探两次确认"。
+  // 复测仍 429 = 没恢复；复测 200 = 解限。误报由 10 分钟周期的再次探测自然纠正。
   const now = Date.now();
   if (p.ok) {
     const downFor = st.since ? Math.round((now - st.since) / 60000) : null;
@@ -139,10 +134,10 @@ async function reprobe(key, st) {
     log(`${key}（${label}）已恢复（限了约 ${downFor == null ? '?' : downFor} 分钟），${Math.round(REST_AFTER_OK_MS / 60000)} 分钟后再探`);
     appendEvent('rate-recovered', { model, group: model, account: acct, accountLabel: label, downForMin: downFor });
   } else if (p.rateLimited) {
-    st.resetAt = p.resetAt; st.at = now;
+    st.resetAt = p.resetAt ?? null; st.at = now;
     // 429 带官方重置时间 → 下次探测直接改到重置点；没时间就按兜底间隔
-    st.nextProbeAt = p.resetAt ? p.resetAt : now + IDLE_RETRY_MS;
-    log(`${key}（${label}）到点仍限流，重置≈${fmtTime(p.resetAt)}`);
+    st.nextProbeAt = p.resetAt ?? (now + IDLE_RETRY_MS);
+    log(`${key}（${label}）到点仍限流${p.resetAt ? '，重置≈' + fmtTime(p.resetAt) : '（无官方时间）'}`);
   } else {
     st.at = now; st.nextProbeAt = now + IDLE_RETRY_MS;
     log(`${key}（${label}）复测异常：${p.reason}`);
@@ -179,22 +174,22 @@ async function tick(state) {
     if (st.at && now - st.at < PROBE_INTERVAL_MS) continue;
     let p = await probe(token, st.model);
     if (p.skip) continue;
-    // 429 复探确认；无官方重置时间 = 瞬时/频率限制，不记
-    if (!p.ok && p.rateLimited) {
-      const p2 = await probe(token, st.model);
-      if (p2.ok) { st.at = Date.now(); st.timeouts = 0; log(`${key}（${label}）首探 429 复探 200 ⇒ 瞬时抖动，不标记`); continue; }
-      if (!p2.rateLimited) { st.at = Date.now(); log(`${key}（${label}）复探异常（${p2.reason}）`); continue; }
-      if (!p2.resetAt) { st.at = Date.now(); log(`${key}（${label}）429 无官方重置时间，疑似瞬时/频率，不标记`); continue; }
-      p = p2;
-    }
+    // [2026-10-19 老大钦定：首探 429 即标记]
+    // 取代 10-17 的「首探 429 必须复探确认 + 必须带官方重置时间」——
+    // 那套防误报规矩把国际版的限流全挡了（实测：hy3-intl / deepseek-…-intl 反复探到 429，
+    // 每次都被判"瞬时抖动不标记"或"无官方重置时间不标记" ⇒ 老大看到限流、页面永远不显示）。
+    // 现在：探到 429 就标记 + 记事件；误报风险交给已有的「到点复测」兜底
+    // （reprobe 仍 429 ⇒ 更新 resetAt 重排；复探 200 ⇒ 记恢复 + 歇 1 小时）。
+    // 注：无官方重置时间的 429 也标记，resetAt 留 null，页面显"官方时间待确认"，
+    //     哨兵按 IDLE_RETRY_MS（10 分钟）后自动复测——比漏报好。
     const t = Date.now();
     if (p.ok) { st.status = 'ok'; st.at = t; st.timeouts = 0; st.nextProbeAt = 0; continue; }
-    if (p.rateLimited && p.resetAt) {
+    if (p.rateLimited) {
       const isNew = st.status !== 'rate-limited';
-      st.status = 'rate-limited'; st.resetAt = p.resetAt; st.since = t; st.at = t; st.reason = p.reason; st.source = 'probe';
-      st.nextProbeAt = p.resetAt; // 🔴 下次探测直接改到官方重置点
-      if (isNew) appendEvent('rate-limited', { model: st.model, group: st.model, account: acct, accountLabel: label, reason: p.reason, resetAt: p.resetAt, resetAtText: fmtTime(p.resetAt), source: 'probe' });
-      log(`${key}（${label}）撞限流，${fmtTime(p.resetAt)} 到点自动复测`);
+      st.status = 'rate-limited'; st.resetAt = p.resetAt ?? null; st.since = t; st.at = t; st.reason = p.reason; st.source = 'probe';
+      st.nextProbeAt = p.resetAt ?? (t + IDLE_RETRY_MS); // 有官方重置点就排到点，否则 10 分钟后再看
+      if (isNew) appendEvent('rate-limited', { model: st.model, group: st.model, account: acct, accountLabel: label, reason: p.reason, resetAt: p.resetAt ?? null, resetAtText: p.resetAt ? fmtTime(p.resetAt) : null, source: 'probe' });
+      log(`${key}（${label}）撞限流${p.resetAt ? '，' + fmtTime(p.resetAt) + ' 到点自动复测' : '（无官方重置时间，10 分钟后自动复测）'}`);
       continue;
     }
     // 超时/异常：连续 3 次判挂死（无官方时间，兜底 IDLE_RETRY 后复测）
