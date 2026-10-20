@@ -752,10 +752,10 @@ if (!live.length) {
   process.exit(1);
 }
 // [2026-10-20 老大定] 三把钥匙一一对应三个账号：
-//   lc-200418 → cnLive（国内 workbuddy 单账号）
-//   in-200418 → intlLive（国际 workbuddy-ai 单账号）
-//   db-200418 → debLive（Debian 副号）
-// 改完后 lc 不再通吃国际，litellm 的 -intl 组已同步换成 in-200418。
+//   <国内钥匙> → cnLive（国内 workbuddy 单账号）
+//   <国际钥匙> → intlLive（国际 workbuddy-ai 单账号）
+//   <副号钥匙> → debLive（Debian 副号）
+// 改完后 lc 不再通吃国际，litellm 的 -intl 组已同步换成 <国际钥匙>。
 const cnLive = live.filter((rt) => rt.variant.id === 'workbuddy');
 const intlLive = live.filter((rt) => rt.variant.id === 'workbuddy-ai');
 
@@ -2260,9 +2260,9 @@ const server = http.createServer(async (req, res) => {
   }
   // 其余路由：Bearer TOKEN（多 token 任一匹配即可）
   // [2026-10-20 老大定] 三把钥匙一一对应三个账号：
-  //   lc-200418 → cnLive（国内 workbuddy）
-  //   in-200418 → intlLive（国际 workbuddy-ai）
-  //   db-200418 → debLive（Debian 副号）
+  //   <国内钥匙> → cnLive（国内 workbuddy）
+  //   <国际钥匙> → intlLive（国际 workbuddy-ai）
+  //   <副号钥匙> → debLive（Debian 副号）
   const auth = req.headers.authorization || '';
   let pool = cnLive;
   // [2026-10-20 老大定·账本改造] 从 token 反查 caller 名（token.txt 的「名字|token」格式）
