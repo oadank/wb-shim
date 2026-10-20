@@ -7,7 +7,7 @@
 //
 // 用法（token 默认读 token.txt 第一行；模型默认 deepseek-v4.1-flash）：
 //   node probe-identity.mjs "You are Claude Code, Anthropic's official CLI for Claude."
-//   node probe-identity.mjs --model glm-5.3-flash --token in-200418 "句子1" "句子2"
+//   node probe-identity.mjs --model glm-5.3-flash --token <你的钥匙> "句子1" "句子2"
 //
 // 🔴 探针走的是 wb-shim（:18796），所以**已经在 IDENTITY_SCRUBS 表里的句子必然 PASS**
 //    （它测的是"净化之后发给上游的内容"）。它真正的用途：拿到一句**新**的可疑句子时，

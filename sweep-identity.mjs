@@ -10,7 +10,7 @@
 // 🔴 全部走 `--raw` 语义：直接打 /v1/messages（Anthropic 路由，不经净化层），
 //    否则测出来永远是 PASS，等于自欺。
 //
-// 用法：node sweep-identity.mjs [--model deepseek-v4.1-flash] [--token lc-200418]
+// 用法：node sweep-identity.mjs [--model deepseek-v4.1-flash] [--token <你的钥匙>]
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
