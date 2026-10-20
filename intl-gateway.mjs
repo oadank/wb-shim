@@ -32,7 +32,7 @@
  */
 
 import { randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -77,16 +77,117 @@ export function appVersionFor(region) {
 }
 
 /**
+ * [2026-10-21 对账改造] 官方客户端的会话请求 id 是 **UUIDv7 的 32 位 hex**（无横线），
+ * 官方账本 `get-user-request-usage` 的 requestId 原样用它当主键（样例如
+ * 01a159d3831f73aba12027abaa850e9c，前 12 位 hex = 毫秒时间戳）。
+ * 原来这里发的是 randomUUID()（UUIDv4 带横线）——官方照样收，但格式和官方客户端不一致，
+ * 且这个 id 从来没落到我们自己的账里，导致事后只能靠"时间窗"对账（会串账）。
+ * 这里改成同款 UUIDv7-32hex，并把它记进 ring，供 daemon 取用对账。
+ */
+export function uuidv7Hex() {
+  const ts = Date.now().toString(16).padStart(12, '0').slice(-12); // 48bit 毫秒时间戳
+  const rand12 = randomBytes(2).toString('hex').slice(0, 3);       // 12bit 随机
+  const variant = '89ab'[randomBytes(1)[0] & 3];                    // RFC4122 variant
+  const rand60 = randomBytes(8).toString('hex').slice(0, 15);       // 60bit 随机
+  return `${ts}7${rand12}${variant}${rand60}`;
+}
+
+// 最近发出去的会话请求 id（daemon 拿来和官方账 join）。上限 500，够一轮对账。
+// [2026-10-21 修] 光放内存不够：官方入账有 1~2 分钟延迟，等 pill 去查时 id 可能已被
+// 挤出 ring 或进程重启丢了，两边永远对不上（实测：官方那两笔 0.31 在，ring 里已没有）。
+// 所以每条同时**追加落盘**，查询时合并内存 + 文件。
+const CONV_RING = [];
+const CONV_LOG = join(homedir(), '.dsh', 'wb-shim-conv-ids.jsonl');
+export function recordConvId(rec) {
+  try {
+    const row = { ...rec, consumed: false };
+    CONV_RING.push(row);
+    if (CONV_RING.length > 500) CONV_RING.splice(0, CONV_RING.length - 500);
+    appendFileSync(CONV_LOG, JSON.stringify({ t: row.t, id: row.id, region: row.region, model: row.model }) + '\n');
+  } catch {}
+}
+
+/**
+ * [2026-10-21 对账·主动派发] daemon 在发请求前 push 一个 convId 进来，网关这次就用它。
+ * 为什么不用"事后认领"：认领要在 ring 里按 model+时间猜，ring 一重启就断、并发也容易错。
+ * 主动派发是 FIFO 的——daemon 发请求和网关开流在同一进程里顺序一致，
+ * 天然对齐到"这一次请求"，且这个 id 会同时出现在官方账 requestId 和我们的 credit-log 里。
+ */
+const PENDING_CONV_IDS = [];
+export function takePendingConvId() {
+  try { return PENDING_CONV_IDS.shift() || ''; } catch { return ''; }
+}
+export function pushPendingConvId(id) {
+  try {
+    if (!id) return;
+    PENDING_CONV_IDS.push(String(id));
+    if (PENDING_CONV_IDS.length > 200) PENDING_CONV_IDS.splice(0, PENDING_CONV_IDS.length - 200);
+  } catch {}
+}
+
+/**
+ * daemon 在同一进程里记账时调这个：按 (model, 最近 N 秒) 找一条尚未被认领的，
+ * 认领后置 consumed=true，避免同一 id 被两笔记账重复使用。
+ * 说明：dsh 的调用是串行的，冲突概率极低；即使认领错也只是 id 标错，
+ * **不会多算钱** —— credit 值来自那次响应本身。
+ * @param {{model?:string, withinMs?:number}} q
+ * @returns {string} convId，找不到返回 ''
+ */
+export function claimConvId(q = {}) {
+  try {
+    const model = String(q.model || '');
+    const within = Number(q.withinMs) || 5000;
+    const minT = Date.now() - within;
+    // 从后往前找最新的未认领项（同一 model 优先）
+    for (let i = CONV_RING.length - 1; i >= 0; i--) {
+      const r = CONV_RING[i];
+      if (!r || r.consumed) continue;
+      if ((r.t || 0) < minT) break;
+      if (model && r.model && r.model !== model) continue;
+      r.consumed = true;
+      return r.id;
+    }
+    return '';
+  } catch { return ''; }
+}
+/**
+ * [2026-10-21 修] 查 convId 时**合并内存 ring + 落盘文件**。
+ * 只读 ring 会漏：官方入账慢（1~2 分钟），等前端来取时 id 早被挤出 500 条上限，
+ * 实测因此出现"官方账 0.31 在、我们这边一个 id 都对不上 ⇒ pill 显示 0"。
+ * 文件按天粗略截断（保留最近约 2 万行），避免无限增长。
+ */
+export function knownConvIds(since = 0) {
+  const out = [];
+  const seen = new Set();
+  for (const r of CONV_RING) {
+    if ((r.t || 0) < since || seen.has(r.id)) continue;
+    seen.add(r.id); out.push(r);
+  }
+  try {
+    const lines = readFileSync(CONV_LOG, 'utf8').split('\n');
+    const tail = lines.slice(-20000);
+    for (const l of tail) {
+      if (!l) continue;
+      let r; try { r = JSON.parse(l); } catch { continue; }
+      if (!r || !r.id || (r.t || 0) < since || seen.has(r.id)) continue;
+      seen.add(r.id); out.push({ ...r, consumed: true }); // 文件里的视为已认领
+    }
+  } catch { /* 还没生成过文件 */ }
+  return out.sort((a, b) => (a.t || 0) - (b.t || 0));
+}
+
+/**
  * 官方客户端网关头（每次调用生成新 trace/UUID，复用同一套会被判重放）。
  * 顺序无关，键名大小写不敏感（HTTP 头规范）。
  */
-export function officialGatewayHeaders() {
+export function officialGatewayHeaders(opts = {}) {
   const traceId = randomBytes(16).toString('hex');
   const spanId = randomBytes(8).toString('hex');
   const parentSpanId = randomBytes(8).toString('hex');
   return {
     'X-Conversation-ID': randomUUID(),
-    'X-Conversation-Request-ID': randomUUID(),
+    // [2026-10-21] 这个就是官方账本主键：格式对齐官方客户端（UUIDv7 32hex），可外部注入以便对账
+    'X-Conversation-Request-ID': opts.conversationRequestId || uuidv7Hex(),
     'acp-connection-id': randomUUID(),
     'X-Conversation-Message-ID': randomUUID(),
     'X-Request-ID': randomUUID(),
@@ -189,10 +290,27 @@ export function wrapIntlGatewayClient(client, opts = {}) {
       // 写死 = 客户端一升级就又对不上，正是本次事故的根因之一。
       'User-Agent': `WorkBuddy/${appVersionFor(regionOf(credential.domain))} ${isGlobal ? 'WorkBuddy AI' : 'WorkBuddy'}/${appVersionFor(regionOf(credential.domain))}`,
     };
+    // [2026-10-21 对账改造] daemon 预先派发的 id 优先用（这样账本那行早就知道自己是谁），
+    // 没有派发才自己生成。两条路都保证：官方账 requestId == 我们的 convId。
+    const convId = takePendingConvId() || uuidv7Hex();
     // [2026-10-20 老大定] 通行证全版本加：国内版也一样穿官方客户端网关头。
     // 理由：这套头就是官方客户端原样，加了只会更像官方、不会更不像；
     // 官方哪天对国内版跟进风控，我们已经在门内，无需临时改动。
-    Object.assign(headers, officialGatewayHeaders());
+    Object.assign(headers, officialGatewayHeaders({ conversationRequestId: convId }));
+    try {
+      let bodyModel = '';
+      try { bodyModel = JSON.parse(body)?.model || ''; } catch {}
+      recordConvId({ t: Date.now(), id: convId, region: isGlobal ? 'global' : 'cn', model: bodyModel, uid: credential.uid || '' });
+      // [2026-10-21 对账实测] 官方账本那一行的 requestId 到底取自哪个头？把这次发出的
+      // 四个随机 id 全打出来，拿官方明细逐一对号——别再靠猜。
+      logger.error(`[ConvId] ${convId} region=${isGlobal ? 'global' : 'cn'} model=${bodyModel} hdrs=${JSON.stringify({
+        'X-Conversation-Request-ID': headers['X-Conversation-Request-ID'],
+        'X-Conversation-ID': headers['X-Conversation-ID'],
+        'X-Request-ID': headers['X-Request-ID'],
+        'acp-connection-id': headers['acp-connection-id'],
+        'X-Conversation-Message-ID': headers['X-Conversation-Message-ID'],
+      })}`);
+    } catch {}
     try {
       const response = await fetch(`${base}/v2/chat/completions`, {
         method: 'POST',
