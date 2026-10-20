@@ -142,10 +142,13 @@ function withUsageLabels(payload) {
   try {
     const used = new Map();
     payload.variants = (payload.variants || []).map((v) => {
-      if (v.label) return v;
-      const idx = used.get(v.id) || 0; used.set(v.id, idx + 1);
-      const matches = allRuntimes.filter((r) => r.variant.id === v.id);
-      return { ...v, label: matches[idx]?.label || v.id };
+      // [2026-10-20 老二抓打脸] label 不信快照——历史缓存里的 label 是落盘当时的名字
+      // （改名多次就有几套），一律按"快照名→内部 key→当前自定义名"重算。
+      const acctKey = snapshotLabelToKey(v.label || '', v.id);
+      const matches = allRuntimes.filter((r) => acctKeyOfRuntime(r, CN_VARIANT.id) === acctKey);
+      const label = matches[0]?.label || acctLabel(acctKey);
+      used.set(v.id, (used.get(v.id) || 0) + 1);
+      return { ...v, label };
     });
   } catch { }
   return payload;
@@ -1266,9 +1269,10 @@ function renderDashboardInner() {
   const evTypeLabel = { 'rate-limited': '限流', 'rate-recovered': '恢复', 'model-added': '上新', 'model-removed': '下架', 'model-expired': '到期', 'expiry-extended': '延期', 'expiry-notice': '预告', 'promo-added': '促销', 'promo-removed': '促销结束' };
   const evText = (e) => {
     // 限流/恢复两条与事件页同源同格式（2026-10-18 老大钦定：不拼官方英文原文，时间取自事件数据）
-    // 账号归属：优先 accountLabel；旧事件没有这字段就用 account 键反查——限流必标账号
+    // 账号归属：一律按内部 account 键反查当前自定义名（10-20 老二定：不信 accountLabel 快照，
+    // 改名后历史事件也要跟新名走）；旧事件缺 account 字段才回落快照 label
     const name = e.model || e.group || '';
-    const acctName = e.accountLabel || acctLabel(e.account);
+    const acctName = acctLabel(e.account) || e.accountLabel || acctLabel('workbuddy');
     const acct = ' ( ' + acctName + ' )';
     if (e.type === 'rate-limited') {
       const t = e.resetAt ? new Date(e.resetAt).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : null;
@@ -1284,7 +1288,7 @@ function renderDashboardInner() {
     if (e.models && e.models.length) p.push(e.models.join('、'));
     else if (e.model) p.push(e.model);
     if (e.variant) p.push('(' + e.variant + ')');
-    if (e.accountLabel) p.push(e.accountLabel);
+    if (e.account) p.push(acctLabel(e.account)); // 10-20 老二抓：按内部键反查当前名，不信快照
     if (e.resetAt) p.push('预计 ' + fmtTime(e.resetAt) + ' 解除');
     if (e.note) p.push(e.note);
     if (e.text) p.push(e.text);
@@ -1442,9 +1446,10 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,(c)=>({'&':'&amp;'
 function fmtT(ms){if(!ms)return '-';const d=new Date(ms);const p=(n)=>String(n).padStart(2,'0');return d.getFullYear()+'/'+p(d.getMonth()+1)+'/'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
 function leftText(ms){if(ms<=0)return '已经到期了';const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);if(d>0)return '还能用 '+d+' 天'+(h?' '+h+' 小时':'');if(h>0)return '还能用 '+h+' 小时'+(m?' '+m+' 分':'');return '还剩 '+m+' 分钟'}
 function evText(e){
-  // 限流/恢复两条按老大钦定格式输出，不拼官方英文原文；账号必标（旧事件缺 accountLabel 用 account 反查）
+  // 限流/恢复两条按老大钦定格式输出，不拼官方英文原文；账号必标
+  // [10-20 老二抓] 不信 accountLabel 快照（改名后旧事件要跟新名），一律按 account 内部键反查
   const name=e.model||e.group||'';
-  const acctName=e.accountLabel||acctLabelOf(e.account);
+  const acctName=acctLabelOf(e.account)||e.accountLabel;
   const acct=' ( '+acctName+' )';
   if(e.type==='rate-limited'){
     // [2026-10-20 老大定] 无官方时间按 429 类型写清楚，别写"时间待确认"
@@ -1460,7 +1465,7 @@ function evText(e){
   // [2026-10-20] variant 显示名：新事件落盘时已是自定义名；旧事件存的是内部 id，
   // 这里过一遍前端映射兜底（VARIANT_LABELS 由服务端注入），改名后旧事件也跟着变。
   if(e.variant)p.push('('+variantLabelOf(e.variant)+')');
-  if(e.accountLabel)p.push(e.accountLabel);
+  if(e.account)p.push(acctLabelOf(e.account)); // 10-20 老二抓：内部键反查当前名，不信快照
   if(e.leftText)p.push('还剩 '+e.leftText);
   if(e.expiryText)p.push('免费到 '+e.expiryText);
   if(e.resetAt)p.push('预计 '+fmtT(e.resetAt)+' 解除');
