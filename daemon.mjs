@@ -600,17 +600,18 @@ async function sweep(rt) {
 // intl 下标=1 ⇒ desktopPathOverride=1 ⇒ readFile(1) 崩（CN 下标 0 falsy 才没暴露）。必须显式只传 variant。
 const runtimes = WORKBUDDY_VARIANTS.map((variant) => buildRuntime(variant));
 
-// [2026-10-20] 国际版渠道校验通关层：包装国际版 rt.client，chatStream 走带官方网关卡头的
-// 直连上游实现（详见 intl-gateway.mjs 头注释）。国内版 client 不包装，零行为变化。
+// [2026-10-20] 渠道校验通关层：包装 rt.client，chatStream 走带官方客户端网关卡头的
+// 直连上游实现（详见 intl-gateway.mjs 头注释）。
+// 🔴 老大定案：国内外全版本都包——这套头是官方客户端原样，穿上只会更像官方；
+// 官方哪天对国内版跟进风控，我们已在门内，不必临时改动。排障可用
+// WB_SHIM_GATEWAY_CN=0 让国内版退回插件原装路径做对照。
 // 必须在 createWorkBuddyShim 之前包——插件 shim 内部持的就是我们传进去的这个对象。
 for (const rt of runtimes) {
-  if (rt.variant.id === 'workbuddy-ai') {
-    try {
-      rt.client = wrapIntlGatewayClient(rt.client, { logger: console });
-      log('intl-gateway', '国际版 chatStream 已挂渠道校验网关头（daemon 直连上游）');
-    } catch (e) {
-      log('intl-gateway', '包装失败，国际版继续用插件原装路径:', String(e));
-    }
+  try {
+    rt.client = wrapIntlGatewayClient(rt.client, { logger: console });
+    log('gateway', `${rt.variant.id}: chatStream 已挂官方客户端网关头（daemon 直连上游）`);
+  } catch (e) {
+    log('gateway', `${rt.variant.id} 包装失败，继续用插件原装路径:`, String(e));
   }
 }
 
@@ -655,6 +656,8 @@ if (DEBIAN_TOKEN) {
   const debRt = buildRuntime(debVariant, DEBIAN_AUTH_FILE);
   debRt.isDebian = true;
   try {
+    // [2026-10-20] Debian 账号同样是国内版 CN，一样穿官方网关头（全版本统一）。
+    debRt.client = wrapIntlGatewayClient(debRt.client, { logger: console });
     const shim = createWorkBuddyShim({ store: debRt.store, client: debRt.client, catalog: debRt.catalog, logger: console });
     await shim.ready;
     debRt._pluginShim = shim;

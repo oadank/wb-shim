@@ -19,13 +19,16 @@
  *    客户端真实 chat 请求比插件多发：会话链路四件套 + x-codebuddy-request:1
  *    + X-Agent-Intent/Purpose + X-Private-Data + W3C trace 七件套。
  *
- * ■ 生效范围
- *    仅 regionOf(credential.domain)==='global'（国际版）。国内版一行不加，
- *    保持原样——国内版若跟进同款风控，把 shouldPatch 的 domain 判断去掉即可。
+ * ■ 生效范围（2026-10-20 老大定案）
+ *    国内外全版本都穿官方客户端网关头。理由：这套头就是官方客户端原样，
+ *    穿上只会更像官方、不会更不像；官方哪天对国内版跟进风控，我们已在门内，
+ *    不必临时改代码+重启（少一次改动 = 少一个风险窗口）。
+ *    排障开关：WB_SHIM_GATEWAY_CN=0 → 国内版退回插件原装路径做对照；
+ *              wrapIntlGatewayClient(..., { intlOnly: true }) → 只包国际版。
  *
  * ■ 维护提示
  *    上游若升级校验（比如加签名、加 device token），先扒新版客户端 asar 的
- *    applyGatewayHeaders 对比本模块的 GATEWAY_EXTRA_HEADERS，缺啥补啥。
+ *    applyGatewayHeaders 对比本模块的 officialGatewayHeaders，缺啥补啥。
  */
 
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -116,7 +119,9 @@ export function officialGatewayHeaders() {
  */
 export function wrapIntlGatewayClient(client, opts = {}) {
   const logger = opts.logger || console;
-  const intlOnly = opts.intlOnly !== false;
+  // [2026-10-20 老大定] 默认全版本生效。要只给国际版加（排障对照）传 intlOnly: true；
+  // 全开状态下国内版可用 WB_SHIM_GATEWAY_CN=0 退回插件原装路径。
+  const intlOnly = opts.intlOnly === true;
 
   // 复刻插件的请求体预处理（顺序必须一致，否则上游可能拒）
   const prepareBody = (bodyJson) => {
@@ -144,7 +149,14 @@ export function wrapIntlGatewayClient(client, opts = {}) {
   };
 
   const patchedChatStream = async (credential, bodyJson, signal) => {
+    // [2026-10-20 老大定] 默认全版本生效（intlOnly=false）：国内版先穿好通行证，
+    // 等官方哪天跟进风控时直接豁免，不必临时改代码+重启。关掉仅用于排障对照：
+    // WB_SHIM_GATEWAY_CN=0 环境下国内版退回插件原装路径。
+    const cnOptOut = process.env.WB_SHIM_GATEWAY_CN === '0';
     if (intlOnly && regionOf(credential.domain) !== 'global') {
+      return client.chatStream(credential, bodyJson, signal);
+    }
+    if (!intlOnly && cnOptOut && regionOf(credential.domain) !== 'global') {
       return client.chatStream(credential, bodyJson, signal);
     }
     const isGlobal = regionOf(credential.domain) === 'global';
@@ -177,7 +189,10 @@ export function wrapIntlGatewayClient(client, opts = {}) {
       // 写死 = 客户端一升级就又对不上，正是本次事故的根因之一。
       'User-Agent': `WorkBuddy/${appVersionFor(regionOf(credential.domain))} ${isGlobal ? 'WorkBuddy AI' : 'WorkBuddy'}/${appVersionFor(regionOf(credential.domain))}`,
     };
-    if (isGlobal) Object.assign(headers, officialGatewayHeaders());
+    // [2026-10-20 老大定] 通行证全版本加：国内版也一样穿官方客户端网关头。
+    // 理由：这套头就是官方客户端原样，加了只会更像官方、不会更不像；
+    // 官方哪天对国内版跟进风控，我们已经在门内，无需临时改动。
+    Object.assign(headers, officialGatewayHeaders());
     try {
       const response = await fetch(`${base}/v2/chat/completions`, {
         method: 'POST',
