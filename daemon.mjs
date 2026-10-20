@@ -56,18 +56,31 @@ function readUsageDayCache(day) {
   try { const p = join(HERE, 'logs', 'usage-cache', `${day}.json`); if (existsSync(p)) return JSON.parse(readFileSync(p, 'utf8')); } catch {}
   return null;
 }
+// 缓存里的 label 快照 → 内部 account key（10-20 建）。
+// 历史缓存落的 label 是当时名字（改过几次名就有几套），只有 variant.id 是稳定的。
+// 排行/趋势聚合一律用内部 key，显示时才转当前自定义名——改名后历史数据自动跟着新名走。
+const SNAPSHOT_LABEL_TO_KEY = {};
+for (const [k, v] of Object.entries({ workbuddy: ['Lecoo', 'LeCoo', 'oadank', '阿丹'], 'workbuddy-ai': ['Lecoo-intl', 'intl', 'ntl'], 'workbuddy-deb': ['N5105', 'debian', '0796'] })) {
+  for (const alias of v) SNAPSHOT_LABEL_TO_KEY[alias] = k;
+}
+function snapshotLabelToKey(label, variantId) {
+  if (SNAPSHOT_LABEL_TO_KEY[label]) return SNAPSHOT_LABEL_TO_KEY[label];
+  // variant.id 本身就是内部 key（CN=intl 同 id 'workbuddy'，Debian 另算）；多账号同 id 时 label 已区分
+  if (variantId === 'workbuddy-deb') return 'workbuddy-deb';
+  return variantId; // 'workbuddy'（CN 与 INTL 同 id，靠 label 别名区分；认不出的落默认）
+}
 function dayTotals(day) {
   const c = readUsageDayCache(day);
   if (!c) return { credit: 0, requests: 0, byModel: new Map() };
   let credit = 0, requests = 0; const byModel = new Map();
   for (const v of c.variants || []) {
     credit += (v.total || 0); requests += (v.requests || 0);
-    // [2026-10-19] 键带账号：同一模型名在三个账号下都会出现（国内/国际/N5105），
-    // 按名字聚合会把三家混成一行 ⇒ 排行必须"模型+账号"才算一行。
-    const acct = v.label || v.id || '';
+    // [2026-10-20 修] 聚合键用内部 account key（稳定），不用 label 快照（改名就断）。
+    // 显示名在读端（ac()）才转。CN 与 INTL variant.id 同为 'workbuddy'，靠 label 别名表区分。
+    const acctKey = snapshotLabelToKey(v.label || '', v.id);
     for (const m of v.models || []) {
-      const k = `${acct}|${m.name}`;
-      const e = byModel.get(k) || { name: m.name, acct, requests: 0, credit: 0 };
+      const k = `${acctKey}|${m.name}`;
+      const e = byModel.get(k) || { name: m.name, acctKey, requests: 0, credit: 0 };
       e.requests += m.requests; e.credit += m.credit; byModel.set(k, e);
     }
   }
@@ -810,11 +823,11 @@ function buildRateState() {
     const resetAt = st?.resetAt ?? null;
     const prev = byModel.get(model);
     if (!prev) {
-      byModel.set(model, { group: model, model, accounts: [account], accountStatus: [{ account, status, resetAt }], status, statusText: status === 'rate-limited' ? '被限流（恢复时自动解除）' : '正常', since: st?.since ?? null, resetAt, resetText: resetAt ? new Date(resetAt).toLocaleString('zh-CN', { hour12: false }) : null });
+      byModel.set(model, { group: model, model, accounts: [account], accountStatus: [{ account, status, resetAt }], status, statusText: status === 'rate-limited' ? '被限流（恢复时自动解除）' : '正常', since: st?.since ?? null, resetAt, reason: st?.reason ?? null, resetText: resetAt ? new Date(resetAt).toLocaleString('zh-CN', { hour12: false }) : null });
       continue;
     }
     prev.accounts.push(account);
-    prev.accountStatus.push({ account, status, resetAt });
+    prev.accountStatus.push({ account, status, resetAt, reason: st?.reason ?? null });
     // 任一账号限流 → 该模型算限流；多账号都限流取较晚的预计恢复
     if (status === 'rate-limited' && prev.status !== 'rate-limited') { prev.status = 'rate-limited'; prev.statusText = '被限流（恢复时自动解除）'; }
     if (status === 'rate-limited' && (resetAt || 0) > (prev.resetAt || 0)) { prev.resetAt = resetAt; prev.resetText = new Date(resetAt).toLocaleString('zh-CN', { hour12: false }); }
@@ -1241,7 +1254,7 @@ function renderDashboardInner() {
   const today = todayStr();
   const todayT = dayTotals(today);
   const rankMap = new Map();
-  for (let i = 0; i < 7; i++) { const t = dayTotals(dateMinus(i)); for (const [k, v] of t.byModel) { const e = rankMap.get(k) || { name: v.name, acct: v.acct, requests: 0, credit: 0 }; e.requests += v.requests; e.credit += v.credit; rankMap.set(k, e); } }
+  for (let i = 0; i < 7; i++) { const t = dayTotals(dateMinus(i)); for (const [k, v] of t.byModel) { const e = rankMap.get(k) || { name: v.name, acct: v.acctKey, requests: 0, credit: 0 }; e.requests += v.requests; e.credit += v.credit; rankMap.set(k, e); } }
   const rank = [...rankMap.values()].sort((a, b) => b.requests - a.requests).slice(0, 5);
   const maxRank = Math.max(1, ...rank.map((r) => r.requests));
 
@@ -1250,13 +1263,16 @@ function renderDashboardInner() {
   const evTypeLabel = { 'rate-limited': '限流', 'rate-recovered': '恢复', 'model-added': '上新', 'model-removed': '下架', 'model-expired': '到期', 'expiry-extended': '延期', 'expiry-notice': '预告', 'promo-added': '促销', 'promo-removed': '促销结束' };
   const evText = (e) => {
     // 限流/恢复两条与事件页同源同格式（2026-10-18 老大钦定：不拼官方英文原文，时间取自事件数据）
-    // 账号归属：优先 accountLabel；旧事件没有这字段就用 account 键反查，再兜底 Lecoo——限流必标账号
+    // 账号归属：优先 accountLabel；旧事件没有这字段就用 account 键反查——限流必标账号
     const name = e.model || e.group || '';
-    const acctName = e.accountLabel || acctLabel(e.account) || 'Lecoo';
+    const acctName = e.accountLabel || acctLabel(e.account);
     const acct = ' ( ' + acctName + ' )';
     if (e.type === 'rate-limited') {
       const t = e.resetAt ? new Date(e.resetAt).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : null;
-      return name + acct + ' 限流中，将于 ' + (t || '时间待确认') + ' 解除 · 错误码：429';
+      // [2026-10-20 老大定] 无官方时间的 429 别写"时间待确认"，按 429 类型写清楚：
+      // queue.waiting=繁忙排队等待（官方没给时间，通常几分钟自愈）；其余显示"官方未给解除时间"。
+      const when = t ? '将于 ' + t + ' 解除' : (e.reason && /queue\.waiting/i.test(e.reason) ? '繁忙排队等待中（官方未给时间，通常几分钟自愈）' : '限流中（官方未给解除时间）');
+      return name + acct + ' ' + when + ' · 错误码：429';
     }
     if (e.type === 'rate-recovered') {
       return name + acct + ' 限流已解除' + (e.downForMin != null ? '，共限流 ' + e.downForMin + ' 分钟' : '');
@@ -1428,7 +1444,9 @@ function evText(e){
   const acctName=e.accountLabel||acctLabelOf(e.account);
   const acct=' ( '+acctName+' )';
   if(e.type==='rate-limited'){
-    return name+acct+' 限流中，将于 '+(e.resetAt?fmtT(e.resetAt):'时间待确认')+' 解除 · 错误码：429';
+    // [2026-10-20 老大定] 无官方时间按 429 类型写清楚，别写"时间待确认"
+    var when=e.resetAt?fmtT(e.resetAt):(e.reason&&/queue\.waiting/i.test(e.reason)?'繁忙排队等待中（官方未给时间，通常几分钟自愈）':'限流中（官方未给解除时间）');
+    return name+acct+' '+(e.resetAt?'将于 '+when+' 解除':when)+' · 错误码：429';
   }
   if(e.type==='rate-recovered'){
     return name+acct+' 限流已解除'+(e.downForMin!=null?'，共限流 '+e.downForMin+' 分钟':'');
@@ -1462,8 +1480,10 @@ async function load(){
     const items=limited.map(l=>{
       const accs=(l.accountStatus||[]).filter(a=>a.status==='rate-limited');
       const accTxt=accs.map(a=>labelFor(a.account)).join('、')||labelFor('workbuddy');
-      const eta=l.resetAt?fmtT(l.resetAt):'时间待确认';
-      return '<div class="lim-item"><span class="lim-name">'+esc(l.model||l.group)+'</span><span class="lim-acct">'+esc(accTxt)+'</span><span class="lim-eta">预计 '+esc(eta)+' 恢复</span></div>';
+      // [2026-10-20 老大定] 无官方时间按类型写清楚（queue.waiting=繁忙排队等待）
+      const isQueue=l.reason&&/queue\.waiting/i.test(l.reason);
+      const etaTxt=l.resetAt?('预计 '+fmtT(l.resetAt)+' 恢复'):(isQueue?'繁忙排队等待中（官方未给时间，通常几分钟自愈）':'限流中（官方未给解除时间）');
+      return '<div class="lim-item"><span class="lim-name">'+esc(l.model||l.group)+'</span><span class="lim-acct">'+esc(accTxt)+'</span><span class="lim-eta">'+esc(etaTxt)+'</span></div>';
     }).join('');
     sumHtml='<div class="lim-head"><span class="lim-dot"></span><b>有 '+limited.length+' 个模型正被限流</b><span class="lim-note">到点自动复测，解限后自动更新</span></div>'+items;
   }else if(free.length){
@@ -1504,7 +1524,7 @@ async function load(){
       const tags=accts.map(a=>'<span class="acct-tag '+(a.status==='rate-limited'?'err':'ok')+'">'+esc(labelFor(a.account))+(a.status==='rate-limited'?' · 限流':' · 正常')+'</span>').join('');
       const anyLimited=accts.some(a=>a.status==='rate-limited');
       let eta;
-      if(anyLimited){ const hit=accts.filter(a=>a.status==='rate-limited'&&a.resetAt)[0]; eta=hit?fmtT(hit.resetAt):'官方时间待确认'; }
+      if(anyLimited){ const hit=accts.filter(a=>a.status==='rate-limited')[0]; eta=hit?(hit.resetAt?fmtT(hit.resetAt):(hit.reason&&/queue\.waiting/i.test(hit.reason)?'繁忙排队等待中':'限流中（官方未给时间）')):'限流中（官方未给时间）'; }
       else eta='<span class="ok-note">正常访问</span>';
       H.push('<tr><td><b>'+esc(r.model||r.group)+'</b></td><td>'+tags+'</td><td class="evtext">'+eta+'</td></tr>');
     }
