@@ -47,9 +47,11 @@ const CREDITS_CACHE_TTL_MS = Number(process.env.WB_SHIM_CREDITS_CACHE_TTL_MS || 
 // Debian 独立账号（N5105 小主机，国内版 CN，独立积分池）开关
 const DEBIAN_AUTH_FILE = process.env.WB_SHIM_DEBIAN_AUTH_FILE || 'C:\\D\\opt\\wb-shim\\debian-auth.json';
 const DEBIAN_TOKEN = process.env.WB_SHIM_DEBIAN_TOKEN || '';
-// [2026-10-20 老大定] 国际版专用 token：in-200418 → workbuddy-ai 单账号。
-// env 可覆盖（WB_SHIM_INTL_TOKEN），缺省用铁律规定的固定值。
-const INTL_TOKEN = process.env.WB_SHIM_INTL_TOKEN || 'in-200418';
+// [2026-10-20 老大定] 国际版专用 key → workbuddy-ai 单账号。
+// [2026-10-21 脱敏] 原先把 key 硬编码在这里（公开仓库会泄），改成只从 env 读：
+// 本机由 nssm AppEnvironmentExtra 注入 WB_SHIM_INTL_TOKEN；没配就是空，
+// 此时国际钥匙不可用（不影响国内/副号两把），源码里不再出现秘密默认值。
+const INTL_TOKEN = process.env.WB_SHIM_INTL_TOKEN || '';
 // [2026-10-15 dsh] usage-detail 缓存（key=YYYY-MM-DD；历史日期永久缓存，今天 60s TTL）
 const usageCache = new Map();
 function todayStr() { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }
