@@ -17,6 +17,7 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { variantLabel } from './display.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const EVENTS_FILE = process.env.WB_EVENTS_FILE || join(HERE, 'events.jsonl');
@@ -31,6 +32,9 @@ function loadHooks() {
 /** 记一条事件。type 见下方常量；payload 自由字段（model/group/reason/resetAt...） */
 export function appendEvent(type, payload = {}) {
   const ev = { ts: Date.now(), type, ...payload };
+  // [2026-10-20] variant 写显示名（自定义，开源用户看到自己的名字而非内部 id）。
+  // history 是快照：改名后旧事件保持当时名字，这是日志常规做法。
+  if (ev.variant) { try { ev.variant = variantLabel(ev.variant); } catch { /* display.mjs 缺席时保持原值 */ } }
   try {
     // 🔴 credits-low（积分低水位）只保留最新一条（老大：历史记录不存这个）——先剔旧再写
     if (type === 'credits-low' && existsSync(EVENTS_FILE)) {

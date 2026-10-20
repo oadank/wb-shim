@@ -231,6 +231,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendEvent, readEvents } from './events.mjs';
 import { acctLabel, acctKeyOfRuntime } from './accounts.mjs';
+import { variantLabel, getDisplayConfig, setDisplayConfig } from './display.mjs';
 import { recordUsage, recordLimit } from './usage-log.mjs';
 // [2026-10-19] 国际版官方站 fetch failed 修复：Node 24 没有 node:undici 内置模块，
 // wb-shim 也没装 undici 包 ⇒ 走每请求 Connection: close（禁 keep-alive，坏连接不进池）。
@@ -470,7 +471,9 @@ function isFreeModel(m) {
  * 目录变化检测（2026-10-15 瘦身版）：目录重抓后对比全量模型名单，
  * 增/减都记时间线事件（model-added / model-removed）——这就是"刷新主页模型
  * 新增与减少"的份内自动化。限免名单翻转额外记 rt.alerts（/alerts 端点用）。
+ * [2026-10-20] catalogChangeSig：60 秒同内容去重窗（防双路径重复记同一上新）。
  */
+const catalogChangeSig = new Map();
 function detectCatalogChanges(rt, models) {
   const nowIds = (models ?? []).map((m) => m.id).sort();
   const prevIds = rt.modelIds;
@@ -478,6 +481,21 @@ function detectCatalogChanges(rt, models) {
   if (!prevIds) return; // 首轮建基线，不记事件
   const removed = prevIds.filter((id) => !nowIds.includes(id));
   const added = nowIds.filter((id) => !prevIds.includes(id));
+  // [2026-10-20 修] 同一 rt 短时间内重复记同样事件（老大截图：minimax-m3.1-flash 在
+  // workbuddy 下 05:03:21 连发两条）——sweep 里超龄重抓路径和登录刷新路径都会调本函数，
+  // 第二次调用时 rt.modelIds 已被第一次更新，本不该再报；重复来自两条路径同分钟各跑一次
+  // 且第一次的基线还没建立（或目录内容在两条路径间抖动）。加 60 秒同内容去重窗。
+  if (added.length || removed.length) {
+    const sig = `${rt.variant.id}|+${added.join(',')}|-${removed.join(',')}`;
+    const last = catalogChangeSig.get(sig);
+    if (last && Date.now() - last < 60_000) {
+      log(rt.variant.id, `目录变化 60 秒内重复（${added.length}+/-${removed.length}-），去重不记`);
+      return;
+    }
+    catalogChangeSig.set(sig, Date.now());
+    // 顺手清 10 分钟前的旧签名，防 Map 无限长
+    for (const [k, t] of catalogChangeSig) if (Date.now() - t > 600_000) catalogChangeSig.delete(k);
+  }
   if (removed.length) appendEvent('model-removed', { variant: rt.variant.id, models: removed });
   if (added.length) appendEvent('model-added', { variant: rt.variant.id, models: added });
   if (added.length || removed.length) log(rt.variant.id, `目录变化：+${added.length} / -${removed.length}${added.length ? ' 增: ' + added.join(', ') : ''}${removed.length ? ' 减: ' + removed.join(', ') : ''}`);
@@ -1371,14 +1389,20 @@ load();
  * 🔴 文案铁律（2026-10-14 老大令）：每个字过一遍"老大能看懂吗"，不用术语。
  */
 function renderEventsInner() {
+  // [2026-10-20] 前端映射由服务端渲染时注入（用户自定义显示名实时生效，不再写死 Lecoo 套）。
+  // 服务端禁止函数调用进前端（2026-10-19 翻车教训），这里只注入纯数据。
+  const _disp = getDisplayConfig();
+  const _dispJson = JSON.stringify({ accounts: _disp.accounts, variants: _disp.variants }).replace(/</g, '\\u003c');
   return `<div class="wrap">
 <div id="content"><div class="card"><div class="empty">加载中…</div></div></div>
 <script>(function(){
 // 🔴 前端 script 里禁止调用服务端函数（acctLabel 等）——浏览器里不存在 ⇒ ReferenceError
-// ⇒ load() 中断 ⇒ 页面永远停在"加载中..."（2026-10-19 实测翻车）。账号键→人话名在前端
-// 自带一份；改显示名请同时改 ./accounts.mjs（服务端唯一真源）。
-const ACCT_LABELS={workbuddy:'Lecoo','workbuddy-ai':'Lecoo-intl','workbuddy-deb':'N5105'};
+// ⇒ load() 中断 ⇒ 页面永远停在"加载中..."（2026-10-19 实测翻车）。映射由服务端注入为纯数据。
+const DISP=${_dispJson};
+const ACCT_LABELS=DISP.accounts;
+const VARIANT_LABELS=DISP.variants;
 const acctLabelOf=(k)=>ACCT_LABELS[k]||k;
+const variantLabelOf=(k)=>VARIANT_LABELS[k]||k;
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function fmtT(ms){if(!ms)return '-';const d=new Date(ms);const p=(n)=>String(n).padStart(2,'0');return d.getFullYear()+'/'+p(d.getMonth()+1)+'/'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
 function leftText(ms){if(ms<=0)return '已经到期了';const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);if(d>0)return '还能用 '+d+' 天'+(h?' '+h+' 小时':'');if(h>0)return '还能用 '+h+' 小时'+(m?' '+m+' 分':'');return '还剩 '+m+' 分钟'}
@@ -1396,7 +1420,9 @@ function evText(e){
   const p=[];
   if(e.models&&e.models.length)p.push(e.models.join('、'));
   else if(e.model)p.push(e.model);
-  if(e.variant)p.push('('+e.variant+')');
+  // [2026-10-20] variant 显示名：新事件落盘时已是自定义名；旧事件存的是内部 id，
+  // 这里过一遍前端映射兜底（VARIANT_LABELS 由服务端注入），改名后旧事件也跟着变。
+  if(e.variant)p.push('('+variantLabelOf(e.variant)+')');
   if(e.accountLabel)p.push(e.accountLabel);
   if(e.leftText)p.push('还剩 '+e.leftText);
   if(e.expiryText)p.push('免费到 '+e.expiryText);
@@ -1592,6 +1618,41 @@ function renderSettingsInner() {
 <table><thead><tr><th>机器</th><th>账号标识</th><th style="text-align:right">剩余积分</th><th style="text-align:right">总量</th><th>状态</th></tr></thead><tbody>
 ${rows || '<tr><td colspan="5" class="empty">没有可见账号</td></tr>'}
 </tbody></table>
+</div>
+<div class="card"><h2>显示名设置</h2><div class="q">给你的设备/账号起自己的名字，全站（看板/积分/模型/事件/设置）自动同步。开源用户不必沿用默认名。</div>
+<div class="kv" id="disp-f">
+  <b>本机账号</b><input class="disp-in" data-key="accounts.workbuddy" />
+  <b>国际版账号</b><input class="disp-in" data-key="accounts.workbuddy-ai" />
+  <b>Debian 账号</b><input class="disp-in" data-key="accounts.workbuddy-deb" />
+  <b>国内版标题</b><input class="disp-in" data-key="variants.workbuddy" />
+  <b>国际版标题</b><input class="disp-in" data-key="variants.workbuddy-ai" />
+</div>
+<div style="margin-top:10px"><button class="pg" id="disp-save">保存显示名</button> <span id="disp-msg" class="subtle"></span></div>
+<script>(function(){
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function loadDisp(){
+  try{
+    const d=await(await fetch('/api/display',{cache:'no-store'})).json();
+    document.querySelectorAll('.disp-in').forEach(function(i){
+      const k=i.getAttribute('data-key'); const sec=k.split('.')[0], key=k.split('.')[1];
+      i.value=(d[sec]&&d[sec][key])||'';
+      i.placeholder=key;
+    });
+  }catch(e){}
+}
+document.getElementById('disp-save').onclick=async function(){
+  const body={accounts:{},variants:{}};
+  document.querySelectorAll('.disp-in').forEach(function(i){
+    const k=i.getAttribute('data-key').split('.');
+    body[k[0]][k[1]]=i.value.trim();
+  });
+  try{
+    const r=await(await fetch('/api/display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    document.getElementById('disp-msg').textContent=r.ok?'✅ 已保存，全站生效':'❌ '+esc(r.error||'保存失败');
+  }catch(e){document.getElementById('disp-msg').textContent='❌ '+esc(e.message)}
+};
+loadDisp();
+})();</script>
 </div>
 <div class="card"><h2>连接方式</h2>
 <div class="connline">地址 <code class="copy-source">http://100.108.133.82:18796/v1</code><button class="copy-button" data-copy="http://100.108.133.82:18796/v1">⧉</button></div>
@@ -1878,6 +1939,39 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (urlPath === '/api/router' || urlPath === '/api/router/')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(await buildRouterData(), null, 2));
+    return;
+  }
+  // [2026-10-20] /api/display：显示名读写（GET 免鉴权；POST 要 Bearer——改显示名是写操作）
+  if (req.method === 'GET' && (urlPath === '/api/display' || urlPath === '/api/display/')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(getDisplayConfig()));
+    return;
+  }
+  if (req.method === 'POST' && (urlPath === '/api/display' || urlPath === '/api/display/')) {
+    const auth = req.headers.authorization || '';
+    if (!TOKENS.some((t) => auth === `Bearer ${t.token}`)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => { size += c.length; if (size > 65536) { req.destroy(); } else chunks.push(c); });
+    req.on('end', () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const merged = setDisplayConfig({
+          accounts: body.accounts || {},
+          variants: body.variants || {},
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, config: merged }));
+        log('[display] 显示名已更新（全站生效）');
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: String(e).slice(0, 160) }));
+      }
+    });
     return;
   }
   // [2026-10-15 dsh] /usage：官方积分明细页——按模型聚合的官方真账，日期可选
