@@ -1941,19 +1941,16 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(await buildRouterData(), null, 2));
     return;
   }
-  // [2026-10-20] /api/display：显示名读写（GET 免鉴权；POST 要 Bearer——改显示名是写操作）
+  // [2026-10-20] /api/display：显示名读写（读写都免鉴权）。
+  // 🔴 10-20 老大纠正：POST 要 Bearer 是蠢设计——浏览器里根本没有 API key，
+  // 设置页保存必报 unauthorized。显示名不是敏感数据（页面本身也免鉴权），与 /api/rate-state
+  // 那种"会被外部注入污染的状态"不同，读写都放开。
   if (req.method === 'GET' && (urlPath === '/api/display' || urlPath === '/api/display/')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(getDisplayConfig()));
     return;
   }
   if (req.method === 'POST' && (urlPath === '/api/display' || urlPath === '/api/display/')) {
-    const auth = req.headers.authorization || '';
-    if (!TOKENS.some((t) => auth === `Bearer ${t.token}`)) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
-      return;
-    }
     const chunks = [];
     let size = 0;
     req.on('data', (c) => { size += c.length; if (size > 65536) { req.destroy(); } else chunks.push(c); });
