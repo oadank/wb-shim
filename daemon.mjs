@@ -22,6 +22,9 @@ import {
 
 import { execSync } from 'node:child_process';
 
+// [2026-10-20] 国际版渠道校验通关层（自己的模块，不动第三方 node_modules）
+import { wrapIntlGatewayClient } from './intl-gateway.mjs';
+
 // 未导出（exports 地图挡了子路径）→ 按 file URL 直 import 分块文件，绕过 exports；
 // 解析 URL 与主包内部引用一致 ⇒ 同一模块实例。`b` 是 0.7.1 的压缩导出名
 // （index.js:1 `import { b as atRestKeyProviderFor }`），升级需核对。
@@ -584,6 +587,20 @@ async function sweep(rt) {
 // intl 下标=1 ⇒ desktopPathOverride=1 ⇒ readFile(1) 崩（CN 下标 0 falsy 才没暴露）。必须显式只传 variant。
 const runtimes = WORKBUDDY_VARIANTS.map((variant) => buildRuntime(variant));
 
+// [2026-10-20] 国际版渠道校验通关层：包装国际版 rt.client，chatStream 走带官方网关卡头的
+// 直连上游实现（详见 intl-gateway.mjs 头注释）。国内版 client 不包装，零行为变化。
+// 必须在 createWorkBuddyShim 之前包——插件 shim 内部持的就是我们传进去的这个对象。
+for (const rt of runtimes) {
+  if (rt.variant.id === 'workbuddy-ai') {
+    try {
+      rt.client = wrapIntlGatewayClient(rt.client, { logger: console });
+      log('intl-gateway', '国际版 chatStream 已挂渠道校验网关头（daemon 直连上游）');
+    } catch (e) {
+      log('intl-gateway', '包装失败，国际版继续用插件原装路径:', String(e));
+    }
+  }
+}
+
 for (const rt of runtimes) {
   const shim = createWorkBuddyShim({ store: rt.store, client: rt.client, catalog: rt.catalog, logger: console });
   try {
@@ -1031,14 +1048,14 @@ function appCredHtml() {
     else { for (const a of c.accounts || []) if (!a.unlimited) remain += (a.remain || 0); }
   }
   const fmtN = (n) => { const s = Number(n).toFixed(2); return s.replace(/\B(?=(\d{3})+(?!\d))/g, ','); };
-  return `<div class="cred-title">${esc(labels.join(' + ') || 'Lecoo')} · 本机</div><div class="cred-sub">凭据已挂载 · 积分更新于 ${esc(fmtTime(updated))}${unlimited ? ' · 不限量' : ' · 余额 ' + fmtN(remain)}</div>`;
+  return `<div class="cred-title">${esc(labels.join(' + ') || acctLabel('workbuddy'))}</div><div class="cred-sub">凭据已接入 · 积分更新于 ${esc(fmtTime(updated))}${unlimited ? ' · 不限量' : ' · 余额 ' + fmtN(remain)}</div>`;
 }
 
 function appSideBar(active) {
   // [2026-10-19 老大点名] 整个侧边栏可收成 52px 图标列（首字当图标），空间全给中间；
   // 收/展状态存 localStorage，刷新不丢。凭据卡片收起态整体隐藏。
   const nav = (id, label) => `<a class="nav ${active === id ? 'on' : ''}" href="#" data-view="${id}" title="${label}"><span class="ico">${label.slice(0, 1)}</span><span class="label">${label}</span></a>`;
-  return `<aside class="side"><div class="topbar-row"><button type="button" class="side-collapse" id="side-collapse" title="收起/展开侧边栏"><span class="ico">«</span></button><button type="button" class="theme-btn" id="theme-toggle" title="切换亮/暗色">◐</button></div><div class="logo"><b>wb-shim</b></div><div class="side-sub">凭据网关 · 本机</div><nav>${nav('dash', '看板')}${nav('credits', '积分')}${nav('models', '模型')}${nav('usage', '用量')}${nav('events', '事件')}${nav('bills', '账单')}${nav('settings', '设置')}</nav><div class="credcard"><button type="button" class="cred-toggle" id="cred-toggle" aria-expanded="true"><span class="cred-title">账号凭据</span><span class="cred-arrow" id="cred-arrow">▾</span></button><div class="cred-body" id="cred-body">${appCredHtml()}</div></div></aside>`;
+  return `<aside class="side"><div class="topbar-row"><button type="button" class="side-collapse" id="side-collapse" title="收起/展开侧边栏"><span class="ico">«</span></button><button type="button" class="theme-btn" id="theme-toggle" title="切换亮/暗色">◐</button></div><div class="logo"><b>wb-shim</b></div><div class="side-sub">模型凭据网关</div><nav>${nav('dash', '看板')}${nav('credits', '积分')}${nav('models', '模型')}${nav('usage', '用量')}${nav('events', '事件')}${nav('bills', '账单')}${nav('settings', '设置')}</nav><div class="credcard"><button type="button" class="cred-toggle" id="cred-toggle" aria-expanded="true"><span class="cred-title">账号凭据</span><span class="cred-arrow" id="cred-arrow">▾</span></button><div class="cred-body" id="cred-body">${appCredHtml()}</div></div></aside>`;
 }
 
 // 完整独立页外壳（保留 /usage 等直接访问入口）
@@ -1142,8 +1159,7 @@ function renderAppShell(defaultView) {
 // 限流/状态=buildRateState；事件=readEvents；模型目录=catalog.current()。
 // JS 每 60s 拉 /usage-detail 把"今天"和趋势补成实时值。
 function renderDashboardInner() {
-  // 账号短名：老大一眼认出是哪台（本机=LeCoo / 国际版=WorkBuddy AI / Debian=备用机）
-  // 账号短名/标签统一走 accounts.mjs 真源（2026-10-19 收口）
+  // 账号短名统一走 accounts.mjs 真源（2026-10-19 收口；10-20 起名字来自 display.json 自定义）
   // 🔴 TDZ 教训（2026-10-19 实测翻车）：acctKeyOf 的 const 声明在函数后半段，
   //    箭头函数里引用它 = "Cannot access before initialization"，被 unhandledRejection
   //    兜底吞掉 → 根路径 / 永远不返回、浏览器干等超时。声明必须早于任何引用。
@@ -1602,7 +1618,9 @@ function renderSettingsInner() {
     const c = rt.credits;
     const remain = c ? (c.unlimited ? '不限' : fmtN((c.accounts || []).reduce((s, a) => s + (a.unlimited ? 0 : (a.remain || 0)), 0))) : '—';
     const total = c ? (c.unlimited ? '不限' : fmtN(c.total ?? 0)) : '—';
-    return `<tr><td><b>${esc2(rt.label)}</b></td><td class="mono">${esc2(rtLabel(rt))}</td><td class="num">${remain}</td><td class="num">${total}</td><td><span class="pill ${c ? 'ok' : 'err'}">${c ? '已挂载' : (rt.creditsError || '未抓取')}</span></td></tr>`;
+    // [2026-10-20 老大定] 只有一个概念：账号（自定义名）。"机器"列和内部标识列都删——
+    // 用户视角只有"我接入了哪些账号"，workbuddy-deb 这类内部 key 不该露给用户。
+    return `<tr><td><b>${esc2(rt.label)}</b></td><td class="num">${remain}</td><td class="num">${total}</td><td><span class="pill ${c ? 'ok' : 'err'}">${c ? '已接入' : (rt.creditsError || '未接入')}</span></td></tr>`;
   }).join('\n');
   return `<div class="wrap">
 <div class="brand"><b>设置</b> · wb-shim 运行状态与凭据</div>
@@ -1611,23 +1629,21 @@ function renderSettingsInner() {
     <b>监听端口</b><span class="mono">${PORT}</span>
     <b>工作目录</b><span class="mono">${esc2(HERE)}</span>
     <b>Token 数</b><span>${TOKENS.length}</span>
-    <b>可见账号</b><span>${allRuntimes.filter((r) => r.catalog.isVisible()).length}</span>
+    <b>接入账号</b><span>${allRuntimes.filter((r) => r.catalog.isVisible()).length}</span>
   </div>
 </div>
-<div class="card"><h2>凭据状态</h2>
-<table><thead><tr><th>机器</th><th>账号标识</th><th style="text-align:right">剩余积分</th><th style="text-align:right">总量</th><th>状态</th></tr></thead><tbody>
-${rows || '<tr><td colspan="5" class="empty">没有可见账号</td></tr>'}
+<div class="card"><h2>接入账号</h2>
+<table><thead><tr><th>账号</th><th style="text-align:right">剩余积分</th><th style="text-align:right">总量</th><th>状态</th></tr></thead><tbody>
+${rows || '<tr><td colspan="4" class="empty">没有可见账号</td></tr>'}
 </tbody></table>
 </div>
-<div class="card"><h2>显示名设置</h2><div class="q">给你的设备/账号起自己的名字，全站（看板/积分/模型/事件/设置）自动同步。开源用户不必沿用默认名。</div>
+<div class="card"><h2>账号名称</h2><div class="q">接入的账号自己起名，全站（看板/积分/模型/事件/设置）自动同步。开源用户不必沿用默认名。</div>
 <div class="kv" id="disp-f">
-  <b>本机账号</b><input class="disp-in" data-key="accounts.workbuddy" />
-  <b>国际版账号</b><input class="disp-in" data-key="accounts.workbuddy-ai" />
-  <b>Debian 账号</b><input class="disp-in" data-key="accounts.workbuddy-deb" />
-  <b>国内版标题</b><input class="disp-in" data-key="variants.workbuddy" />
-  <b>国际版标题</b><input class="disp-in" data-key="variants.workbuddy-ai" />
+  <b>账号一（国内版）</b><input class="disp-in" data-key="accounts.workbuddy" />
+  <b>账号二（国际版）</b><input class="disp-in" data-key="accounts.workbuddy-ai" />
+  <b>账号三（Debian）</b><input class="disp-in" data-key="accounts.workbuddy-deb" />
 </div>
-<div style="margin-top:10px"><button class="pg" id="disp-save">保存显示名</button> <span id="disp-msg" class="subtle"></span></div>
+<div style="margin-top:10px"><button class="pg" id="disp-save">保存账号名称</button> <span id="disp-msg" class="subtle"></span></div>
 <script>(function(){
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 async function loadDisp(){
@@ -1855,7 +1871,7 @@ document.querySelectorAll('.copy-button').forEach(function(b){b.addEventListener
 ${modelsStyle}
 <div class="toolbar"><input id="q" type="search" placeholder="筛选模型…（名称 / 调用 id / 倍率）" autocomplete="off"><span class="subtle" id="qcount"></span></div>
 ${sections}
-<footer>wb-shim 模型目录 · 本机与 Debian 已合并为「国内版」· 调用 id 点右侧 ⧉ 复制 · 上游为 WorkBuddy 客户端私有接口，账号与积分风险自担</footer>
+<footer>wb-shim 模型目录 · 国内版账号已合并 · 调用 id 点右侧 ⧉ 复制 · 上游为 WorkBuddy 客户端私有接口，账号与积分风险自担</footer>
 </div>
 ${modelsScript}`;
 }
