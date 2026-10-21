@@ -963,6 +963,11 @@ function buildHealth() {
 }
 
 /** rate-guard 当前状态（瘦身版：status 只有 ok / rate-limited 两种） */
+
+// [2026-10-21] 429 里"模型繁忙"家族统一话术（见下方 BUSY_RE 用法注释）
+const BUSY_RE = /queue\.(waiting|full)|模型繁忙|Model busy|too many requests|14003/i;
+const BUSY_TEXT = '模型繁忙，请换模型或稍后重试（官方未给时间，通常几分钟自愈）';
+
 function buildRateState() {
   const rg = readJsonSafe(join(WB_DIR, '.rate-guard-state.json'), {});
   // 键=account:model（account: workbuddy 本机 / workbuddy-deb Debian / workbuddy-ai 国际版）；旧键无冒号视为本机
@@ -1502,7 +1507,10 @@ function renderDashboardInner() {
       const t = e.resetAt ? new Date(e.resetAt).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : null;
       // [2026-10-20 老大定] 无官方时间的 429 别写"时间待确认"，按 429 类型写清楚：
       // queue.waiting=繁忙排队等待（官方没给时间，通常几分钟自愈）；其余显示"官方未给解除时间"。
-      const when = t ? '将于 ' + t + ' 解除' : (e.reason && /queue\.waiting/i.test(e.reason) ? '繁忙排队等待中（官方未给时间，通常几分钟自愈）' : '限流中（官方未给解除时间）');
+      // [2026-10-21 老大抓出] 实测国际版报的是 code 14003「模型繁忙，请换模型或稍后重试」
+      // （displayMsg 原文 Model busy），不是 queue.waiting ⇒ 之前落到"官方未给解除时间"，
+      // 等于把自家话术丢了。这里统一按 BUSY_RE 识别所有"模型繁忙/排队"变体。
+      const when = t ? '将于 ' + t + ' 解除' : (BUSY_RE.test(e.reason || '') ? BUSY_TEXT : '限流中（官方未给解除时间）');
       return name + acct + ' ' + when + ' · 错误码：429';
     }
     if (e.type === 'rate-recovered') {
@@ -1666,6 +1674,9 @@ const ACCT_LABELS=DISP.accounts;
 const VARIANT_LABELS=DISP.variants;
 const acctLabelOf=(k)=>ACCT_LABELS[k]||k;
 const variantLabelOf=(k)=>VARIANT_LABELS[k]||k;
+// [2026-10-21] 429「模型繁忙」话术注入前端（浏览器里没有 Node 常量，必须注入纯文本/正则字面量）
+const BUSY_RE=${BUSY_RE};
+const BUSY_TEXT=${JSON.stringify(BUSY_TEXT)};
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function fmtT(ms){if(!ms)return '-';const d=new Date(ms);const p=(n)=>String(n).padStart(2,'0');return d.getFullYear()+'/'+p(d.getMonth()+1)+'/'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
 function leftText(ms){if(ms<=0)return '已经到期了';const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);if(d>0)return '还能用 '+d+' 天'+(h?' '+h+' 小时':'');if(h>0)return '还能用 '+h+' 小时'+(m?' '+m+' 分':'');return '还剩 '+m+' 分钟'}
@@ -1677,7 +1688,7 @@ function evText(e){
   const acct=' ( '+acctName+' )';
   if(e.type==='rate-limited'){
     // [2026-10-20 老大定] 无官方时间按 429 类型写清楚，别写"时间待确认"
-    var when=e.resetAt?fmtT(e.resetAt):(e.reason&&/queue\.waiting/i.test(e.reason)?'繁忙排队等待中（官方未给时间，通常几分钟自愈）':'限流中（官方未给解除时间）');
+    var when=e.resetAt?fmtT(e.resetAt):(BUSY_RE.test(e.reason||'')?BUSY_TEXT:'限流中（官方未给解除时间）');
     return name+acct+' '+(e.resetAt?'将于 '+when+' 解除':when)+' · 错误码：429';
   }
   if(e.type==='rate-recovered'){
@@ -1717,8 +1728,8 @@ async function load(){
       const accs=(l.accountStatus||[]).filter(a=>a.status==='rate-limited');
       const list=accs.length?accs:[{account:'workbuddy',resetAt:l.resetAt,reason:l.reason}];
       for(const a of list){
-        const isQueue=a.reason&&/queue\.waiting/i.test(a.reason);
-        const etaTxt=a.resetAt?('预计 '+fmtT(a.resetAt)+' 恢复'):(isQueue?'繁忙排队等待中（官方未给时间，通常几分钟自愈）':'限流中（官方未给解除时间）');
+        const isQueue=a.reason&&BUSY_RE.test(a.reason||'');
+        const etaTxt=a.resetAt?('预计 '+fmtT(a.resetAt)+' 恢复'):(isQueue||BUSY_RE.test(a.reason||'')?BUSY_TEXT:'限流中（官方未给解除时间）');
         rows.push('<div class="lim-item"><span class="lim-name">'+esc(l.model||l.group)+'</span><span class="lim-acct">'+esc(labelFor(a.account))+'</span><span class="lim-eta">'+esc(etaTxt)+'</span></div>');
       }
     }
@@ -1771,7 +1782,7 @@ async function load(){
         const hits=accts.filter(a=>a.status==='rate-limited');
         eta=hits.map((a)=>{
           const acctName=esc(labelFor(a.account));
-          const t=a.resetAt?fmtT(a.resetAt):((a.reason&&/queue\.waiting/i.test(a.reason))?'繁忙排队等待中':'官方未给时间');
+          const t=a.resetAt?fmtT(a.resetAt):(BUSY_RE.test(a.reason||'')?BUSY_TEXT:'官方未给时间');
           // 每账号一行（不是挤在一起）——两条时间必须有明确分隔
           return '<div class="eta-line">'+acctName+'：'+t+'</div>';
         }).join('');
