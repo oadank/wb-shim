@@ -40,14 +40,41 @@ const log = (...a) => console.log(new Date().toISOString(), '[rate-guard]', ...a
 
 const WB_SHIM = process.env.WB_SHIM_URL || 'http://127.0.0.1:18796';
 const WB_TOKEN_FILE = join(HERE, 'token.txt');
-let wbToken = '';
-function getWbToken() {
-  if (!wbToken) { try { wbToken = readFileSync(WB_TOKEN_FILE, 'utf8').trim(); } catch {} }
-  return wbToken;
+// [2026-10-21 修·国际版限流一整晚不解除的根因] token.txt 是「名字|token」多行格式：
+//   cn|lc-xxx
+//   intl|in-xxx
+// 旧实现 readFileSync(...).trim() 把整个文件当一把 key（含换行+第二行），
+// 而且 tokenFor 让国际版也用「本机 key」——三把钥匙分账号后国际版必须用 in 钥匙，
+// 否则被 wb-shim 账号边界硬闸判 404 "not available for this token"。
+// 404 既不算恢复(200)也不算限流(429) ⇒ 状态永远卡死。
+function parseTokens() {
+  const out = { cn: '', intl: '', db: '' };
+  let raw = '';
+  try { raw = readFileSync(WB_TOKEN_FILE, 'utf8'); } catch { return out; }
+  for (const line of raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)) {
+    const bar = line.indexOf('|');
+    if (bar > 0) {
+      const name = line.slice(0, bar).trim().toLowerCase();
+      const tok = line.slice(bar + 1).trim();
+      if (name && tok && out[name] === '') out[name] = tok;
+    } else if (out.cn === '') {
+      out.cn = line; // 老格式：单行裸 token 视作国内钥匙
+    }
+  }
+  return out;
 }
-function getDebianToken() { return (process.env.WB_SHIM_DEBIAN_TOKEN || '').trim(); }
-// 账号 → token：本机/国际版都用 LeCoo token（国际版靠 -intl 后缀路由），Debian 用 Debian token
-function tokenFor(acct) { return acct === 'workbuddy-deb' ? getDebianToken() : getWbToken(); }
+let wbTokens = null;
+function getTokens() { if (!wbTokens) wbTokens = parseTokens(); return wbTokens; }
+function getWbToken() { return getTokens().cn; }
+function getIntlToken() { return (process.env.WB_SHIM_INTL_TOKEN || '').trim() || getTokens().intl; }
+function getDebianToken() { return (process.env.WB_SHIM_DEBIAN_TOKEN || '').trim() || getTokens().db; }
+// 账号 → 对应钥匙：国内 workbuddy→cn、国际 workbuddy-ai→intl、副号 workbuddy-deb→db。
+// 三把钥匙必须一一对应——wb-shim 有账号边界硬闸，拿错钥匙打别的账号模型会 404。
+function tokenFor(acct) {
+  if (acct === 'workbuddy-deb') return getDebianToken();
+  if (acct === 'workbuddy-ai') return getIntlToken();
+  return getWbToken();
+}
 // 账号显示名/账号维度判定统一走 ./accounts.mjs 唯一真源（2026-10-19 收口，禁止各写一遍）
 const labelFor = acctLabel;
 const accountsFor = accountsForModelGroup;
@@ -145,6 +172,21 @@ async function reprobe(key, st) {
     // 429 带官方重置时间 → 下次探测直接改到重置点；没时间就按兜底间隔
     st.nextProbeAt = p.resetAt ?? (now + IDLE_RETRY_MS);
     log(`${key}（${label}）到点仍限流${p.resetAt ? '，重置≈' + fmtTime(p.resetAt) : '（无官方时间）'}`);
+  } else if (/not available for this token|unauthorized|401|403/i.test(String(p.reason || ''))) {
+    // [2026-10-21 修·关键] 账号边界/鉴权类报错（404 not available for this token / 401）
+    // 说明"这把钥匙探测不到这个模型"，**不是限流**。以前这种情况只更新时间、状态永远卡在
+    // rate-limited（国际版实测从 10-20 11:45 卡到 10-21 10:57 一整晚）。
+    // 处理：判为 ok 并记一条明确原因，让页面别再挂着假限流；同时把错误写进 st.reason 供排查。
+    const wasLimited = st.status === 'rate-limited';
+    const downFor = (wasLimited && st.since) ? Math.round((now - st.since) / 60000) : null;
+    st.status = 'ok'; st.at = now; st.since = null; st.resetAt = null;
+    st.nextProbeAt = now + IDLE_RETRY_MS;
+    st.reason = `探测无效（钥匙/账号边界不匹配，非限流）：${String(p.reason || '').slice(0, 160)}`;
+    log(`${key}（${label}）探测无效（非限流，判为正常）：${p.reason}`);
+    if (wasLimited) {
+      appendEvent('rate-recovered', { model, group: model, account: acct, accountLabel: label, downForMin: downFor });
+      log(`${key}（${label}）原限流记录已解除（此前是探测错误造成的假限流）`);
+    }
   } else {
     st.at = now; st.nextProbeAt = now + IDLE_RETRY_MS;
     log(`${key}（${label}）复测异常：${p.reason}`);
