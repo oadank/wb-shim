@@ -516,10 +516,46 @@ async function fetchCreditsEx(rt, credential) {
   return { total, accounts };
 }
 
+/**
+ * [2026-10-21 老大抓出·首页小数丢失] 向官方 summary 要「剩余积分精确值」。
+ * get-user-resource（fetchCredits 用的）是整数口径：7316 而不是 7316.??；
+ * get-user-resource-summary 的 Packets[].CycleRemainCapacity 才带小数。
+ * 返回求和后的两位小数；拿不到返回 null（调用方退回整数口径，不报错）。
+ */
+async function fetchCreditsSummaryExact(rt, credential) {
+  try {
+    const cred = credential || await rt.store.resolve();
+    const isIntl = rt.variant.id !== CN_VARIANT.id;
+    const base = isIntl ? 'https://www.workbuddy.ai' : 'https://www.codebuddy.cn';
+    const headers = { 'Authorization': `Bearer ${cred.accessToken}`, 'Accept': 'application/json', 'Content-Type': 'application/json' };
+    if (cred.uid) headers['X-User-Id'] = cred.uid;
+    if (cred.domain) headers['X-Domain'] = cred.domain;
+    const resp = await fetch(`${base}/billing/meter/get-user-resource-summary`, {
+      method: 'POST', headers, body: JSON.stringify({}),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok) return null;
+    const j = await resp.json().catch(() => null);
+    const pkgs = j?.data?.Packages;
+    if (!Array.isArray(pkgs)) return null;
+    let tot = 0;
+    for (const p of pkgs) tot += Number(p?.CycleRemainCapacity) || 0;
+    return Math.round(tot * 100) / 100;
+  } catch { return null; }
+}
+
 /** 抓积分（照抄 apply 的账号轮询：fetchCredits(credential)）。失败保留旧值，error 记原因。 */
 async function refreshCredits(rt, credential) {
   try {
     const c = await fetchCreditsEx(rt, credential);
+    // [2026-10-21 老大抓出·首页小数丢失] fetchCredits 走 get-user-resource 是**整数口径**
+    // （7316 而不是 7316.??），首页按 accounts[].remain 汇总就丢了小数，显示成 7,316.00。
+    // 这里顺手向 summary（get-user-resource-summary，CycleRemainCapacity 带小数）要一份精确值，
+    // 存成 remainExact 挂到 credits 上，供首页/凭据卡优先使用。失败不影响主流程。
+    try {
+      const prec = await fetchCreditsSummaryExact(rt, credential);
+      if (prec !== null) c.remainExact = prec;
+    } catch { /* 拿不到就退回整数口径 */ }
     rt.credits = c;
     rt.creditsAtMs = Date.now();
     // [2026-10-15 dsh] 官方周期用量快照（按包 CycleCapacityUsed）：烧速告警/摘要的"烧了多少"直接用这个官方数，
@@ -1381,7 +1417,13 @@ function renderDashboardInner() {
     if (c.unlimited) { creditsUnlimited = true; rtRemain = Infinity; }
     else {
       if (c.total != null) creditsTotal += c.total;
-      for (const a of c.accounts || []) if (!a.unlimited) rtRemain += (a.remain || 0);
+      // [2026-10-21 修] 优先用 summary 的精确小数（remainExact），
+      // 没有才退回 accounts[].remain 求和（那是整数口径，会显示成 7,316.00）。
+      if (typeof c.remainExact === 'number' && Number.isFinite(c.remainExact)) {
+        rtRemain = c.remainExact;
+      } else {
+        for (const a of c.accounts || []) if (!a.unlimited) rtRemain += (a.remain || 0);
+      }
       creditsRemain += rtRemain;
     }
     creditByAcct.push({ label: acctShort(rt), remain: rtRemain, unlimited: c.unlimited === true, alive: !rt.creditsError });
