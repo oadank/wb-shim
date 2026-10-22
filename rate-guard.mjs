@@ -27,8 +27,16 @@ const CONFIG = join(HERE, 'rate-guard.json');
 const STATE_FILE = process.env.RATE_GUARD_STATE || join(HERE, '.rate-guard-state.json');
 const IDLE_MS = Number(process.env.RATE_GUARD_IDLE_MS || 60_000);                 // 空闲读盘间隔（本地，不打官方）
 const IDLE_RETRY_MS = Number(process.env.RATE_GUARD_IDLE_RETRY_MS || 10 * 60 * 1000); // 无 resetAt 兜底复测间隔
-// 定期轻探测（老大 2026-10-18 定）：每模型每账号 10 分钟探一次，max_tokens=1 最省额度；
-// 429 带官方时间 → 下次探测改到该时间；解限后暂停 1 小时再恢复定期探测。只探限流，不碰积分接口。
+// 🔴 [2026-10-21 11:30 老大拍板·止血] 定期主动探测**默认全关**。
+// 起因：副号（N5105）被官方回 400 code=11140「账号存在异常行为，已被限制使用」——
+// 02:44 起 4 个受管模型全探到该错误，而哨兵还在每 10 分钟往被封账号上撞。
+// 老大原话「难道是我们的探测造成的，那得关闭探测啊」。10-18 就该做的事拖到今天。
+// 关掉后：
+//   - 限流信号只来自**真实流量**（daemon 代理转发吃到 429 时写状态，第一手零额外请求）
+//   - 已标记 rate-limited 的到点复测**保留**（那是解限确认，不是主动招惹）
+//   - 要临时开回：RATE_GUARD_PROBE_ENABLED=1 + 重启 rate-guard
+const PROBE_ENABLED = String(process.env.RATE_GUARD_PROBE_ENABLED ?? '0') === '1';
+// 定期轻探测间隔（仅 PROBE_ENABLED=1 时生效）
 const PROBE_INTERVAL_MS = Number(process.env.RATE_GUARD_PROBE_INTERVAL_MS || 10 * 60 * 1000);
 const REST_AFTER_OK_MS = Number(process.env.RATE_GUARD_REST_MS || 60 * 60 * 1000);
 const PROBE_TIMEOUT_MS = Number(process.env.RATE_GUARD_TIMEOUT_MS || 60_000);
@@ -48,7 +56,7 @@ const WB_TOKEN_FILE = join(HERE, 'token.txt');
 // 否则被 wb-shim 账号边界硬闸判 404 "not available for this token"。
 // 404 既不算恢复(200)也不算限流(429) ⇒ 状态永远卡死。
 function parseTokens() {
-  const out = { cn: '', intl: '', db: '' };
+  const out = { cn: '', intl: '' };
   let raw = '';
   try { raw = readFileSync(WB_TOKEN_FILE, 'utf8'); } catch { return out; }
   for (const line of raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)) {
@@ -67,11 +75,9 @@ let wbTokens = null;
 function getTokens() { if (!wbTokens) wbTokens = parseTokens(); return wbTokens; }
 function getWbToken() { return getTokens().cn; }
 function getIntlToken() { return (process.env.WB_SHIM_INTL_TOKEN || '').trim() || getTokens().intl; }
-function getDebianToken() { return (process.env.WB_SHIM_DEBIAN_TOKEN || '').trim() || getTokens().db; }
-// 账号 → 对应钥匙：国内 workbuddy→cn、国际 workbuddy-ai→intl、副号 workbuddy-deb→db。
-// 三把钥匙必须一一对应——wb-shim 有账号边界硬闸，拿错钥匙打别的账号模型会 404。
+// 账号 → 对应钥匙：国内 workbuddy→cn、国际 workbuddy-ai→intl。
+// 两把钥匙必须一一对应——wb-shim 有账号边界硬闸，拿错钥匙打别的账号模型会 404。
 function tokenFor(acct) {
-  if (acct === 'workbuddy-deb') return getDebianToken();
   if (acct === 'workbuddy-ai') return getIntlToken();
   return getWbToken();
 }
@@ -200,8 +206,6 @@ async function tick(state) {
     const cfg = JSON.parse(readFileSync(CONFIG, 'utf8'));
     for (const g of cfg.groups ?? []) {
       for (const acct of accountsFor(g.group)) {
-        // 没配 Debian token 就跳过 Debian 账号（没凭据探不了，别留空条目）
-        if (acct.key === 'workbuddy-deb' && !getDebianToken()) continue;
         const key = acct.key + ':' + g.group;
         if (!state[key]) state[key] = { account: acct.key, model: g.group, status: 'ok', at: 0 };
       }
@@ -217,7 +221,6 @@ async function tick(state) {
     const valid = new Set();
     for (const g of cfg.groups ?? []) {
       for (const acct of accountsFor(g.group)) {
-        if (acct.key === 'workbuddy-deb' && !getDebianToken()) continue;
         valid.add(acct.key + ':' + g.group);
       }
     }
@@ -241,7 +244,9 @@ async function tick(state) {
       continue;
     }
     // 正常态：解限后歇 1 小时；否则每 PROBE_INTERVAL_MS 轻探一次（max_tokens=1）
+    // 🔴 [2026-10-21 老大定] PROBE_ENABLED=0（默认）：不主动探，只等真实流量 429。
     if (st.nextProbeAt && now < st.nextProbeAt) continue;
+    if (!PROBE_ENABLED) continue;               // 关探测：本 tick 一个官方请求都不发
     if (st.at && now - st.at < PROBE_INTERVAL_MS) continue;
     let p = await probe(token, st.model);
     if (p.skip) continue;
@@ -300,7 +305,7 @@ function sleep(ms) {
 async function main() {
   const state = readJsonSafe(STATE_FILE, {});
   migrate(state);
-  log(`启动：限流哨兵（每 ${PROBE_INTERVAL_MS / 60000} 分钟轻探测 max_tokens=1 + 真实流量 429 捕获；429 带官方时间则改到点复测；解限歇 ${REST_AFTER_OK_MS / 60000} 分钟；空闲每 ${IDLE_MS / 1000}s 读盘）`);
+  log(`启动：限流哨兵（主动探测已${PROBE_ENABLED ? '开' : '关'}——只靠真实流量 429 捕获；已标记的到点复测保留；解限歇 ${REST_AFTER_OK_MS / 60000} 分钟；空闲每 ${IDLE_MS / 1000}s 读盘）`);
   while (!stopping) {
     try { const ms = await tick(state); await sleep(ms); }
     catch (e) { log('本轮异常:', String(e).slice(0, 200)); await sleep(IDLE_MS); }

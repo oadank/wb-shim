@@ -25,7 +25,6 @@ const DEFAULTS = {
   accounts: {
     'workbuddy': 'Lecoo',
     'workbuddy-ai': 'Lecoo-intl',
-    'workbuddy-deb': 'N5105',
   },
   variants: {
     'workbuddy': 'Lecoo',

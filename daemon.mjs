@@ -46,7 +46,15 @@ const CREDITS_ALERT_BELOW = Number(process.env.WB_SHIM_CREDITS_ALERT_BELOW || 20
 const CREDITS_CACHE_TTL_MS = Number(process.env.WB_SHIM_CREDITS_CACHE_TTL_MS || 60 * 1000);
 // Debian 独立账号（N5105 小主机，国内版 CN，独立积分池）开关
 const DEBIAN_AUTH_FILE = process.env.WB_SHIM_DEBIAN_AUTH_FILE || 'C:\\D\\opt\\wb-shim\\debian-auth.json';
-const DEBIAN_TOKEN = process.env.WB_SHIM_DEBIAN_TOKEN || '';
+// 🔴 [2026-10-21 11:30 老大拍板·紧急止血] 副号（workbuddy-deb / N5105）被官方封了：
+//   官方回 400 code=11140 "request illegal" / "Your account has been restricted due to
+//   unusual activity"（账号存在异常行为，已被限制使用）——4 个受管模型（glm-5.3-flash /
+//   hy3 / step-5-preview / hy4-preview）全探到，从 02:44 起持续 40+ 分钟。
+//   处理：DEBIAN_KILL_SWITCH=0（默认）时**本服务不再挂载副号 token 路由**，
+//   拿副号 token 打进来的请求一律 403 明确拒绝（让它回落主号/国际号，别静默 404）。
+//   风控解除后设 WB_SHIM_DEBIAN_KILL_SWITCH=1 + 重启即可恢复原状。
+const DEBIAN_KILL_SWITCH = String(process.env.WB_SHIM_DEBIAN_KILL_SWITCH ?? '0') !== '0';
+const DEBIAN_TOKEN = DEBIAN_KILL_SWITCH ? (process.env.WB_SHIM_DEBIAN_TOKEN || '') : '';
 // [2026-10-20 老大定] 国际版专用 key → workbuddy-ai 单账号。
 // [2026-10-21 脱敏] 原先把 key 硬编码在这里（公开仓库会泄），改成只从 env 读：
 // 本机由 nssm AppEnvironmentExtra 注入 WB_SHIM_INTL_TOKEN；没配就是空，
@@ -83,6 +91,9 @@ function dayTotals(day) {
     // [2026-10-20 修] 聚合键用内部 account key（稳定），不用 label 快照（改名就断）。
     // 显示名在读端（ac()）才转。CN 与 INTL variant.id 同为 'workbuddy'，靠 label 别名表区分。
     const acctKey = snapshotLabelToKey(v.label || '', v.id);
+    // [2026-10-23] 副号（N5105/Debian）已删：历史缓存里残留的副号用量不再计进排行/趋势，
+    // 否则会冒出一条没有显示名的幽灵账号行。
+    if (acctKey === 'workbuddy-deb') continue;
     for (const m of v.models || []) {
       const k = `${acctKey}|${m.name}`;
       const e = byModel.get(k) || { name: m.name, acctKey, requests: 0, credit: 0 };
@@ -816,6 +827,11 @@ if (DEBIAN_TOKEN) {
   } catch (e) {
     log('debian', 'Debian shim 启动失败（检查 WB_SHIM_DEBIAN_AUTH_FILE / 凭证是否过期）:', String(e).slice(0, 200));
   }
+} else if (DEBIAN_TOKEN === '' && process.env.WB_SHIM_DEBIAN_TOKEN) {
+  // 🔴 [2026-10-21 11:30 老大拍板·止血] kill switch 合上（默认态）+ 配了副号 env
+  // ⇒ 副号被官方封（400/11140），本轮**不挂载副号**，请求层会 403。
+  //    恢复：WB_SHIM_DEBIAN_KILL_SWITCH=1 + nssm restart wb-shim。
+  log('debian', '⚠️ 副号已被官方限制（400 code=11140 账号异常），kill switch 生效：本轮不挂载副号');
 } else {
   log('debian', '未配置 WB_SHIM_DEBIAN_TOKEN，跳过 Debian 账号');
 }
@@ -1000,7 +1016,7 @@ function buildRateState() {
     const limitedAccts = row.accountStatus.filter((a) => a.status === 'rate-limited');
     if (limitedAccts.length > 1) {
       row.resetText = limitedAccts
-        .map((a) => `${a.account === 'workbuddy' ? '主号' : a.account === 'workbuddy-deb' ? '副号' : '国际'} ${a.resetText ?? '未知'}`)
+        .map((a) => `${a.account === 'workbuddy' ? '主号' : '国际'} ${a.resetText ?? '未知'}`)
         .join('；');
     }
   }
@@ -1257,7 +1273,7 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return
 function p2(n){return String(n).padStart(2,'0')}
 function fmt(ms){if(!ms)return '-';var d=new Date(ms);return p2(d.getMonth()+1)+'/'+p2(d.getDate())+' '+p2(d.getHours())+':'+p2(d.getMinutes())+':'+p2(d.getSeconds())}
 var WHO={dsh:'DSH',claude:'Claude Code'};
-var ACCT={'workbuddy':'国内','workbuddy-ai':'国际','workbuddy-deb':'副号'};
+var ACCT={'workbuddy':'国内','workbuddy-ai':'国际'};
 async function load(){
   var j;
   try{ j=await (await fetch('/api/blocks',{cache:'no-store'})).json(); }
@@ -1452,7 +1468,7 @@ function renderDashboardInner() {
   const modelCn = { 'step-5-preview': '阶跃 Step5（国内版）', 'step-5-preview-intl': '阶跃 Step5（国际版）', 'deepseek-v4.1-flash-intl': 'DeepSeek v4.1 极速版（国际）', 'hy3': '腾讯混元 Hy3（国内）', 'hy3-intl': '腾讯混元 Hy3（国际）', 'hy4-preview': '腾讯混元 Hy4（国内）', 'glm-5.3-flash': 'GLM 5.3 极速' };
   const mc = (m) => modelCn[m] || m;
   // [2026-10-19] 账号键 → 人话名：统一走 accounts.mjs 真源（别处一律 import，别再抄三目）
-  const acctCn = { workbuddy: acctLabel('workbuddy'), 'workbuddy-ai': acctLabel('workbuddy-ai'), 'workbuddy-deb': acctLabel('workbuddy-deb') };
+  const acctCn = { workbuddy: acctLabel('workbuddy'), 'workbuddy-ai': acctLabel('workbuddy-ai') };
   const ac = (a) => acctCn[a] || a;
   // [2026-10-19 老大点名] 排行只显示模型原名（上游 id），不套中文译名——
   // 译名把 hy4-preview/glm-5.3-flash 混成同一个观感，反而看不出谁在烧。账号仍用人话名。
@@ -1904,6 +1920,18 @@ function renderSettingsInner() {
     // 用户视角只有"我接入了哪些账号"，workbuddy-deb 这类内部 key 不该露给用户。
     return `<tr><td><b>${esc2(rt.label)}</b></td><td class="num">${remain}</td><td class="num">${total}</td><td><span class="pill ${c ? 'ok' : 'err'}">${c ? '已接入' : (rt.creditsError || '未接入')}</span></td></tr>`;
   }).join('\n');
+  // [2026-10-23 老大抓] 账号名输入框不许写死序号和数量：旧版硬编码「账号一（国内版）/账号二（国际版）/
+  // 账号三（Debian）」，副号删了还挂在页面上（只检测到 2 个却显示 3 行），开源用户更不知道"账号一"指谁。
+  // 现在按当前真实挂载的账号动态生成，标题 = 当前显示名 + 版本属性（国内版/国际版按 variant 判，不写死）。
+  const acctSeen = new Map();
+  for (const rt of allRuntimes) {
+    const key = acctKeyOfRuntime(rt, CN_VARIANT.id);
+    if (acctSeen.has(key)) continue;
+    acctSeen.set(key, { key, label: acctLabel(key), kind: key === CN_VARIANT.id ? '国内版' : '国际版' });
+  }
+  const acctInputs = acctSeen.size
+    ? [...acctSeen.values()].map((a) => `  <b>${esc2(a.label)} <span class="subtle" style="display:inline">${a.kind}</span></b><input class="disp-in" data-key="accounts.${esc2(a.key)}" />`).join('\n')
+    : '<div class="empty">当前没有接入账号</div>';
   return `<div class="wrap">
 <div class="brand"><b>设置</b> · wb-shim 运行状态与凭据</div>
 <div class="card"><h2>服务信息</h2>
@@ -1921,9 +1949,7 @@ ${rows || '<tr><td colspan="4" class="empty">没有可见账号</td></tr>'}
 </div>
 <div class="card"><h2>账号名称</h2><div class="q">接入的账号自己起名，全站（看板/积分/模型/事件/设置）自动同步。开源用户不必沿用默认名。</div>
 <div class="kv" id="disp-f">
-  <b>账号一（国内版）</b><input class="disp-in" data-key="accounts.workbuddy" />
-  <b>账号二（国际版）</b><input class="disp-in" data-key="accounts.workbuddy-ai" />
-  <b>账号三（Debian）</b><input class="disp-in" data-key="accounts.workbuddy-deb" />
+${acctInputs}
 </div>
 <div style="margin-top:10px"><button class="pg" id="disp-save">保存账号名称</button> <span id="disp-msg" class="subtle"></span></div>
 <script>(function(){
@@ -1947,15 +1973,24 @@ document.getElementById('disp-save').onclick=async function(){
   try{
     const r=await(await fetch('/api/display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
     document.getElementById('disp-msg').textContent=r.ok?'✅ 已保存，全站生效':'❌ '+esc(r.error||'保存失败');
+    // 保存后立刻把左侧标题同步成新名字（标题是服务端按当前名渲染的，不刷会看着没改）
+    if(r.ok){
+      document.querySelectorAll('.disp-in').forEach(function(i){
+        var b=i.previousElementSibling;
+        if(b&&b.firstChild&&b.firstChild.nodeType===3){
+          b.firstChild.nodeValue=(i.value.trim()||i.getAttribute('data-key').split('.')[1])+' ';
+        }
+      });
+    }
   }catch(e){document.getElementById('disp-msg').textContent='❌ '+esc(e.message)}
 };
 loadDisp();
 })();</script>
 </div>
 <div class="card"><h2>连接方式</h2>
-<div class="connline">地址 <code class="copy-source">http://100.108.133.82:18796/v1</code><button class="copy-button" data-copy="http://100.108.133.82:18796/v1">⧉</button></div>
+<div class="connline">地址（远程/tailnet）<code class="copy-source">https://lecoo.tailb5f10f.ts.net:18796/v1</code><button class="copy-button" data-copy="https://lecoo.tailb5f10f.ts.net:18796/v1">⧉</button></div>
+<div class="connline">本机直连 <code class="copy-source">http://127.0.0.1:18796/v1</code><button class="copy-button" data-copy="http://127.0.0.1:18796/v1">⧉</button></div>
 <div class="connline">API Key <span class="subtle" style="display:inline">在服务端 token.txt 文件里</span></div>
-<div class="connline">本机直连把地址换成 <code>127.0.0.1:18796/v1</code></div>
 <div class="connline">协议 <code>/v1/chat/completions</code> · <code>/v1/messages</code> · <code>/v1/responses</code></div>
 </div>
 <div class="card"><h2>模块心跳</h2><div class="q">盯模型状态的几个后台模块，哪个停了这里直接显示（每 60s 自刷新）</div>
@@ -2322,9 +2357,17 @@ const server = http.createServer(async (req, res) => {
   // 请求头 X-WB-Caller 优先（agent 显式上报），否则用 token 名，再否则 unknown。
   const tokenName = TOKENS.find((t) => auth === `Bearer ${t.token}`)?.name || '';
   const callerFromToken = tokenName || (DEBIAN_TOKEN && auth === `Bearer ${DEBIAN_TOKEN}` ? 'debian' : '');
+  // 🔴 [2026-10-21 11:30 老大拍板·止血] 副号被封（官方 400 code=11140 账号异常限制）。
+  // kill switch 合上时：副号钥匙**不再路由到 debLive**，且给 403 明确拒绝，
+  // 让调用方立刻知道该换账号，而不是静默落到主号上继续把主号也拖进限流。
+  if (!DEBIAN_TOKEN && auth === `Bearer ${process.env.WB_SHIM_DEBIAN_TOKEN || ''}` && (process.env.WB_SHIM_DEBIAN_TOKEN || '')) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'debian account suspended by upstream (11140 restricted); use cn/intl token', type: 'account_suspended', code: 'account_suspended' } }));
+    return;
+  }
   if (DEBIAN_TOKEN && auth === `Bearer ${DEBIAN_TOKEN}`) pool = debLive;
   else if (INTL_TOKEN && auth === `Bearer ${INTL_TOKEN}`) pool = intlLive;
-  else if (!TOKENS.some((t) => auth === `Bearer ${t.token}`)) {
+  else if (!TOKENS.some((t) => auth === `Bearer ${t.token}`) && !(!DEBIAN_TOKEN && (process.env.WB_SHIM_DEBIAN_TOKEN || '') && auth === `Bearer ${process.env.WB_SHIM_DEBIAN_TOKEN}`)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'unauthorized', type: 'unauthorized', code: 'unauthorized' } }));
     return;
